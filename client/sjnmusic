@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+
+import json
+import socket
+import sys
+
+SOCKET_PATH = "/tmp/sjnmusic.sock"
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: sjnmusic <command> [value]")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    value = " ".join(sys.argv[2:])
+
+    if cmd == "play":
+        payload = {"Play": value}
+    elif cmd == "add":
+        payload = {"Add": value}
+    elif cmd == "del":
+        payload = {"Del": value}
+    elif cmd == "init":
+        payload = {"Init": value}
+    else:
+        print(f"unknown command: {cmd}")
+        sys.exit(1)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(SOCKET_PATH)
+
+    sock.sendall(json.dumps(payload).encode())
+    sock.close()
+
+if __name__ == "__main__":
+    main()

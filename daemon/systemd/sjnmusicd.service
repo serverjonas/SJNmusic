@@ -1,14 +1,10 @@
 [Unit]
-Description=SJNmusic Daemon
-After=network.target
+Description=sjnmusic daemon
+After=pipewire.service pulseaudio.service
 
 [Service]
-Type=simple
 ExecStart=/usr/bin/sjnmusicd
-Restart=always
-RestartSec=2
-StandardOutput=journal
-StandardError=journal
+Restart=on-failure
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
