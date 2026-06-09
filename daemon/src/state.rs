@@ -64,11 +64,7 @@ impl DaemonState {
             eprintln!("INIT failed: yt-dlp not available or download error");
             return;
         }
-
-        self.queue.push(Song {
-            name,
-            path,
-        });
+        println!("INIT finished: {}", path);
     }
 
     pub fn search(&self, query: &str) -> Option<Song> {
