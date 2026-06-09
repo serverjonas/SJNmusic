@@ -6,4 +6,5 @@ pub enum Command {
     Add(String),
     Del(String),
     Init(String),
+    Search(String),
 }

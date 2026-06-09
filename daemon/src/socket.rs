@@ -22,21 +22,41 @@ pub fn start_socket(state: Arc<Mutex<DaemonState>>) {
             let msg = String::from_utf8_lossy(&buf[..size]);
 
             if let Ok(cmd) = serde_json::from_str::<Command>(&msg) {
-                handle(cmd, state);
+                let response = handle(cmd, state);
+                let _ = stream.write_all(response.as_bytes());
+            } else {
+                let _ = stream.write_all(b"ERROR: Invalid JSON");
             }
-
-            let _ = stream.write_all(b"OK");
         });
     }
 }
 
-fn handle(cmd: Command, state: Arc<Mutex<DaemonState>>) {
+fn handle(cmd: Command, state: Arc<Mutex<DaemonState>>) -> String {
     let mut state = state.lock().unwrap();
 
     match cmd {
-        Command::Play(song) => state.play(song),
-        Command::Add(song) => state.add(song),
-        Command::Del(song) => state.delete(song),
-        Command::Init(song) => state.init(song),
+        Command::Play(query) => {
+            state.play(&query);
+            format!("OK: Playing {}", query)
+        }
+        Command::Add(query) => {
+            state.add(&query);
+            format!("OK: Added {}", query)
+        }
+        Command::Del(query) => {
+            state.delete(&query);
+            format!("OK: Deleted {}", query)
+        }
+        Command::Init(song) => {
+            state.init(song.clone());
+            format!("OK: Downloading {}", song)
+        }
+        Command::Search(query) => {
+            if let Some(song) = state.search(&query) {
+                serde_json::to_string(&song).unwrap_or_else(|_| "ERROR: Serialization failed".to_string())
+            } else {
+                "ERROR: Song not found".to_string()
+            }
+        }
     }
 }
