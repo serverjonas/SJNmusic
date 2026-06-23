@@ -34,3 +34,14 @@ pub fn db_path() -> String {
     p.push("songs.db");
     p.to_string_lossy().to_string()
 }
+
+pub fn config_path() -> String {
+    let mut p = base_dir();
+    p.push("config.toml");
+    p.to_string_lossy().to_string()
+}
+
+pub fn ensure_dirs() {
+    let _ = std::fs::create_dir_all(base_dir());
+    let _ = std::fs::create_dir_all(songs_dir());
+}

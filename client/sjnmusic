@@ -1,36 +1,234 @@
 #!/usr/bin/env python3
+"""
+sjnmusic - tiny CLI for sjnmusicd HTTP daemon.
+Talks to the webserver at http://127.0.0.1:14567 by default. Override with
+--host or --port, or set SJNMUSIC_HOST / SJNMUSIC_PORT environment variables.
+"""
 
+import argparse
 import json
-import socket
+import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-SOCKET_PATH = "/tmp/sjnmusic.sock"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 14567
 
-def main():
-    if len(sys.argv) < 2:
-        print("usage: sjnmusic <command> [value]")
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sjnmusic",
+        description="Talk to the sjnmusicd HTTP daemon.",
+    )
+    p.add_argument("--host", default=os.environ.get("SJNMUSIC_HOST", DEFAULT_HOST))
+    p.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("SJNMUSIC_PORT", str(DEFAULT_PORT))),
+    )
+    p.add_argument("--json", action="store_true", help="print raw JSON responses")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_search_fields(sp):
+        sp.add_argument("query", nargs="*", help="search text")
+        sp.add_argument("-q", "--query", dest="query_flag", help="search text")
+
+    add_search_fields(sub.add_parser("play", help="search & start playing immediately"))
+    add_search_fields(sub.add_parser("add", help="search & append to queue"))
+    add_search_fields(sub.add_parser("del", help="search & delete from disk+db"))
+    add_search_fields(sub.add_parser("init", help="download via yt-dlp and register"))
+    add_search_fields(sub.add_parser("search", help="search the song database"))
+
+    sub.add_parser("queue", help="show the current queue")
+    sub.add_parser("now", help="alias for /now-playing")
+    sub.add_parser("skip", help="skip the next song")
+    sub.add_parser("clear", help="empty the queue")
+    sub.add_parser("songs", help="list all known songs")
+    sub.add_parser("playlists", help="list all playlists")
+    sub.add_parser("help", help="list HTTP endpoints")
+
+    pl_new = sub.add_parser("pl-new", help="create a playlist")
+    pl_new.add_argument("name")
+
+    pl_show = sub.add_parser("pl-show", help="show playlist contents")
+    pl_show.add_argument("name")
+
+    pl_add = sub.add_parser("pl-add", help="add a song to a playlist")
+    pl_add.add_argument("name")
+    pl_add.add_argument("query", nargs="*")
+    pl_add.add_argument("-q", "--query", dest="query_flag")
+
+    pl_play = sub.add_parser("pl-play", help="load a playlist into the queue")
+    pl_play.add_argument("name")
+
+    pl_rm = sub.add_parser("pl-rm", help="delete a playlist")
+    pl_rm.add_argument("name")
+
+    return p
+
+
+def join_query(args) -> str:
+    parts = []
+    if getattr(args, "query_flag", None):
+        parts.append(args.query_flag)
+    if getattr(args, "query", None):
+        parts.extend(args.query)
+    return " ".join(parts).strip()
+
+
+def call(host, port, method, route, body=None, query=None):
+    qs = ""
+    if query:
+        qs = "?" + urllib.parse.urlencode(query)
+    url = f"http://{host}:{port}{route}{qs}"
+
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url=url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = resp.read().decode("utf-8")
+            return resp.status, payload
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        print(f"error: cannot reach daemon at {url}: {e.reason}", file=sys.stderr)
+        sys.exit(2)
+
+
+def print_response(args, status, payload):
+    if args.json:
+        print(f"HTTP {status}\n{payload}")
+        return
+    try:
+        obj = json.loads(payload)
+    except json.JSONDecodeError:
+        print(f"HTTP {status}: {payload}")
+        return
+    if isinstance(obj, dict) and "error" in obj:
+        print(f"error: {obj['error']}", file=sys.stderr)
         sys.exit(1)
+    if "queue" in obj and "current" in obj:
+        print("queue:")
+        for s in obj.get("queue", []):
+            print(f"  - [{s['id']}] {s['name']}")
+        cur = obj.get("current")
+        if cur:
+            print(f"now playing: [{cur['id']}] {cur['name']}")
+        else:
+            print("now playing: (idle)")
+        return
+    if "current" in obj and "queue_len" in obj:
+        cur = obj.get("current")
+        if cur:
+            print(f"now playing: [{cur['id']}] {cur['name']}")
+        else:
+            print("now playing: (idle)")
+        print(f"queue length: {obj['queue_len']}")
+        return
+    if "songs" in obj:
+        for s in obj["songs"]:
+            print(f"[{s['id']}] {s['name']}")
+        return
+    if isinstance(obj, list):
+        if obj and isinstance(obj[0], dict) and obj[0].get("songs") is not None:
+            for pl in obj:
+                print(f"{pl['name']}  ({len(pl.get('songs', []))} songs)")
+                for s in pl.get("songs", []):
+                    print(f"   - [{s['id']}] {s['name']}")
+        else:
+            for s in obj:
+                print(s)
+        return
+    if isinstance(obj, dict) and "name" in obj and "songs" in obj:
+        pl = obj
+        print(f"playlist: {pl['name']}")
+        for s in pl.get("songs", []):
+            print(f"  - [{s['id']}] {s['name']}")
+        return
+    if isinstance(obj, dict) and "endpoints" in obj:
+        for ep in obj["endpoints"]:
+            print(ep)
+        return
+    if isinstance(obj, dict) and "added" in obj:
+        print(f"added [{obj['added']['id']}] {obj['added']['name']} -> {obj['playlist']['name']}")
+        return
+    print(json.dumps(obj, indent=2))
 
-    cmd = sys.argv[1]
-    value = " ".join(sys.argv[2:])
 
-    if cmd == "play":
-        payload = {"Play": value}
-    elif cmd == "add":
-        payload = {"Add": value}
-    elif cmd == "del":
-        payload = {"Del": value}
-    elif cmd == "init":
-        payload = {"Init": value}
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    host, port = args.host, args.port
+    q = join_query(args)
+
+    def with_q(body):
+        body = dict(body or {})
+        if q:
+            body.setdefault("query", q)
+        return body
+
+    if args.cmd == "play":
+        status, payload = call(host, port, "POST", "/play", body=with_q(None))
+    elif args.cmd == "add":
+        status, payload = call(host, port, "POST", "/add", body=with_q(None))
+    elif args.cmd == "del":
+        if not q:
+            print("error: 'del' requires a search query", file=sys.stderr)
+            sys.exit(2)
+        status, payload = call(host, port, "POST", "/del", body=with_q(None))
+    elif args.cmd == "init":
+        if not q:
+            print("error: 'init' requires a song name", file=sys.stderr)
+            sys.exit(2)
+        status, payload = call(host, port, "POST", "/init", body={"song": q})
+    elif args.cmd == "search":
+        if not q:
+            print("error: 'search' requires a query", file=sys.stderr)
+            sys.exit(2)
+        status, payload = call(host, port, "GET", "/search", query={"q": q})
+    elif args.cmd == "queue":
+        status, payload = call(host, port, "GET", "/queue")
+    elif args.cmd == "now":
+        status, payload = call(host, port, "GET", "/now-playing")
+    elif args.cmd == "skip":
+        status, payload = call(host, port, "POST", "/skip")
+    elif args.cmd == "clear":
+        status, payload = call(host, port, "POST", "/queue/clear")
+    elif args.cmd == "songs":
+        status, payload = call(host, port, "GET", "/songs")
+    elif args.cmd == "playlists":
+        status, payload = call(host, port, "GET", "/playlists")
+    elif args.cmd == "help":
+        status, payload = call(host, port, "GET", "/help")
+    elif args.cmd == "pl-new":
+        status, payload = call(host, port, "POST", "/playlists", body={"name": args.name})
+    elif args.cmd == "pl-show":
+        status, payload = call(host, port, "GET", f"/playlists/{urllib.parse.quote(args.name)}")
+    elif args.cmd == "pl-add":
+        if not q:
+            print("error: 'pl-add' requires a song query", file=sys.stderr)
+            sys.exit(2)
+        status, payload = call(
+            host, port, "POST",
+            f"/playlists/{urllib.parse.quote(args.name)}/add",
+            body={"query": q},
+        )
+    elif args.cmd == "pl-play":
+        status, payload = call(host, port, "POST", f"/playlists/{urllib.parse.quote(args.name)}/play")
+    elif args.cmd == "pl-rm":
+        status, payload = call(host, port, "DELETE", f"/playlists/{urllib.parse.quote(args.name)}")
     else:
-        print(f"unknown command: {cmd}")
-        sys.exit(1)
+        status, payload = call(host, port, "GET", "/help")
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(SOCKET_PATH)
+    print_response(args, status, payload)
 
-    sock.sendall(json.dumps(payload).encode())
-    sock.close()
 
 if __name__ == "__main__":
     main()
