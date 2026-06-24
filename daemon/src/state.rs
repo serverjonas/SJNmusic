@@ -316,10 +316,20 @@ impl DaemonState {
         }
         let id = self.queue[0].id;
         // Scope the DB guard so it is dropped before mutating `self.queue`.
+        // Use a MIN(position) subquery instead of `ORDER BY ... LIMIT 1`:
+        // SQLite does not accept `ORDER BY` / `LIMIT` clauses on `DELETE`
+        // statements (parse error: "near \"ORDER\": syntax error"), so the
+        // standard syntax fails entirely. The subquery is portable across all
+        // supported SQLite versions and is equivalent: it deletes the head
+        // occurrence of `song_id` from the queue (oldest by position).
         let result = {
             let conn = self.lock_conn();
             conn.execute(
-                "DELETE FROM queue WHERE song_id = ?1 ORDER BY position ASC LIMIT 1",
+                "DELETE FROM queue
+                 WHERE song_id = ?1
+                   AND position = (
+                       SELECT MIN(position) FROM queue WHERE song_id = ?1
+                   )",
                 params![id],
             )
         };
