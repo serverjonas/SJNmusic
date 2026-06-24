@@ -7,6 +7,7 @@ use crate::{
     audio::spawn_audio_thread,
     config::Config,
     db::open_db,
+    mpris,
     server::start_server,
     state::{DaemonState, RepeatMode, Song},
 };
@@ -23,7 +24,8 @@ pub fn run(cfg: Config) {
         cfg.search.fuzzy_threshold,
         cfg.library.max_queue_size,
         default_repeat,
-        audio_handle,
+        audio_handle.clone(),
+        cfg.download.search_count,
     )));
 
     // HTTP server thread.
@@ -38,6 +40,12 @@ pub fn run(cfg: Config) {
     if let Err(e) = server_handle {
         error!("Failed to spawn HTTP server thread: {e}");
     }
+
+    // MPRIS / D-Bus integration thread. Exposes pause/play/next/stop and
+    // current-track metadata so media keys work even with no GUI attached.
+    // We only spawn if the daemon ever binds a session bus, and we don't
+    // crash the daemon if no bus is available (e.g. inside a container).
+    mpris::spawn(Arc::clone(&state), audio_handle.clone());
 
     info!("Playback loop ready");
 

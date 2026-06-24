@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod daemon;
 mod db;
+mod mpris;
 mod paths;
 mod server;
 mod state;

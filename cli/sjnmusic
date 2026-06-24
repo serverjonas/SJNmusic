@@ -40,7 +40,28 @@ def build_parser() -> argparse.ArgumentParser:
     add_search_fields(sub.add_parser("play", help="search & start playing immediately"))
     add_search_fields(sub.add_parser("add", help="search & append to queue"))
     add_search_fields(sub.add_parser("del", help="search & delete from disk+db"))
-    add_search_fields(sub.add_parser("init", help="download via yt-dlp and register (async)"))
+    init_p = add_search_fields(
+        sub.add_parser(
+            "init",
+            help="download via yt-dlp and register (async); picks a yt-dlp candidate first if interactive",
+        )
+    )
+    init_p.add_argument(
+        "--pick",
+        action="store_true",
+        help="force interactive candidate picker even when stdin is not a TTY",
+    )
+    init_p.add_argument(
+        "--auto",
+        action="store_true",
+        help="skip the candidate picker and download yt-dlp's top result",
+    )
+    init_p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="number of yt-dlp candidates to fetch from /search/yt (default: daemon config)",
+    )
     add_search_fields(sub.add_parser("search", help="search the song database (best match)"))
     add_search_fields(sub.add_parser("search-all", help="search every match above threshold"))
 
@@ -291,7 +312,79 @@ def main(argv=None):
         if not q:
             print("error: 'init' requires a song name", file=sys.stderr)
             sys.exit(2)
-        status, payload = call(host, port, "POST", "/init", body={"song": q})
+        force_pick = getattr(args, "pick", False)
+        force_auto = getattr(args, "auto", False)
+        # `stdin_isatty` controls whether we *auto*-select (non-interactive)
+        # versus *prompt* the user. `--pick` overrides a non-TTY stdin so
+        # scripts can still drive the picker via a piped index if they want.
+        interactive = force_pick or (
+            sys.stdin.isatty() and not force_auto
+        )
+        if not interactive:
+            # Legacy / scripted path: top result only, no round-trip for
+            # the candidate list. The daemon falls back to ytsearch1:NAME
+            # when no URL is supplied.
+            status, payload = call(
+                host, port, "POST", "/init", body={"song": q}
+            )
+        else:
+            limit = getattr(args, "limit", None)
+            query = {"q": q}
+            if limit is not None and limit > 0:
+                query["limit"] = str(limit)
+            status, payload = call(
+                host, port, "GET", "/search/yt", query=query
+            )
+            obj = try_parse(payload)
+            results = (obj or {}).get("results") or []
+            if status != 200:
+                print_response(args, status, payload)
+                sys.exit(1)
+            if not results:
+                print(
+                    f"error: no yt-dlp results for {q!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for i, r in enumerate(results, 1):
+                uploader = r.get("uploader") or "(unknown)"
+                print(
+                    f"[{i}] {r.get('title', '?')}  --  {uploader}  "
+                    f"({fmt_secs(r.get('duration_secs'))})"
+                )
+            try:
+                raw = input("Pick a song [1]: ").strip()
+            except EOFError:
+                print(
+                    "error: no input available; re-run with --auto or supply a piped number",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if raw == "":
+                chosen_idx = 0
+            else:
+                try:
+                    chosen_idx = int(raw) - 1
+                except ValueError:
+                    print(
+                        f"error: not a number: {raw!r}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+            if chosen_idx < 0 or chosen_idx >= len(results):
+                print(
+                    f"error: choice out of range (1-{len(results)})",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            chosen = results[chosen_idx]
+            status, payload = call(
+                host,
+                port,
+                "POST",
+                "/init",
+                body={"name": q, "url": chosen.get("url") or ""},
+            )
     elif args.cmd == "init-batch":
         status, payload = call(
             host, port, "POST", "/init/batch", body={"songs": args.queries}

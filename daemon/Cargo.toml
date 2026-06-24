@@ -16,3 +16,10 @@ env_logger = "0.11"
 toml = "0.8"
 percent-encoding = "2"
 rand = "0.8"
+# `zbus` exposes an org.mpris.MediaPlayer2.sjnmusic service so Linux DEs and
+# media-key daemons can control the daemon even when the GUI process is
+# closed. We run zbus inside a single-threaded tokio runtime hosted by the
+# mpris thread — the rest of the daemon is sync-only.
+zbus = "4"
+zbus_macros = "4"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

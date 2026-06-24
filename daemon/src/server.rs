@@ -83,6 +83,7 @@ fn handle(
                 "GET  /songs?q=",
                 "GET  /search?q=... (best match) or POST /search {query}",
                 "GET  /search/all?q=... (every match above threshold)",
+                "GET  /search/yt?q=...&limit=N (yt-dlp candidates for picker)",
                 "GET  /queue",
                 "GET  /now-playing",
                 "GET  /downloads",
@@ -173,6 +174,24 @@ fn handle(
             Err(e) => error_response(e),
         },
 
+        Route::SearchYt => match query_or_body(&query_params, &body_text) {
+            Ok(q) => {
+                let limit = query_params
+                    .get("limit")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(state.search_count);
+                match state.search_yt_sync(&q, limit) {
+                    Ok(results) => json_response(200, &serde_json::json!({
+                        "query": q,
+                        "limit": limit,
+                        "results": results,
+                    })),
+                    Err(e) => error_response(e),
+                }
+            }
+            Err(e) => error_response(e),
+        },
+
         Route::Queue => json_response(200, &serde_json::json!({
             "queue": state.queue,
             "current": state.current,
@@ -224,9 +243,13 @@ fn handle(
             Err(e) => error_response(e),
         },
 
-        Route::InitAsync => match name_from_body(&body_text) {
-            Ok(song) => {
-                let id = init_async(&arc_for_async, song);
+        Route::InitAsync => match name_and_url_from_body(&body_text) {
+            Ok((song, url)) => {
+                let source = match url {
+                    Some(u) => u,
+                    None => format!("ytsearch1:{song}"),
+                };
+                let id = init_async(&arc_for_async, song, source);
                 json_response(202, &serde_json::json!({
                     "job_id": id,
                     "status": "queued",
@@ -439,6 +462,7 @@ enum Route {
     Songs,
     Search,
     SearchAll,
+    SearchYt,
     Queue,
     NowPlaying,
     Downloads,
@@ -477,6 +501,7 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Get, "/songs") => Route::Songs,
         (m, "/search") if matches!(m, Method::Get | Method::Post) => Route::Search,
         (Method::Get, "/search/all") => Route::SearchAll,
+        (Method::Get, "/search/yt") => Route::SearchYt,
         (Method::Get, "/queue") => Route::Queue,
         (Method::Get, "/now-playing") => Route::NowPlaying,
         (Method::Get, "/downloads") => Route::Downloads,
@@ -617,6 +642,22 @@ fn name_from_body(body: &str) -> Result<String, String> {
         }
     }
     Err("missing 'name' or 'song' in body".to_string())
+}
+
+/// Parse `/init` bodies that may carry an explicit download URL selected via
+/// the search picker. `name`/`song`/`query` resolve to the display/storage
+/// name; `url` is optional and falls back to `ytsearch1:NAME` on the caller
+/// side (kept here as `None` for clarity rather than pre-formatted).
+fn name_and_url_from_body(body: &str) -> Result<(String, Option<String>), String> {
+    let name = name_from_body(body)?;
+    let v = parse_body(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let url = v
+        .as_object()
+        .and_then(|obj| obj.get("url"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok((name, url))
 }
 
 fn songs_from_body(body: &str) -> Result<Vec<String>, String> {

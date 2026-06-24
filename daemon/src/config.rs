@@ -81,6 +81,29 @@ impl Default for SearchConfig {
     }
 }
 
+/// Controls how /init's interactive search picker behaves before downloading
+/// a song. The full picker lives in the CLI; the daemon just exposes how many
+/// candidates to fetch by default and how to invoke `yt-dlp`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadConfig {
+    /// Default number of yt-dlp search candidates shown to the user before a
+    /// download is started. Users can override per-call via `/search/yt?limit=N`.
+    #[serde(default = "default_search_count")]
+    pub search_count: usize,
+}
+
+fn default_search_count() -> usize {
+    3
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            search_count: default_search_count(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -91,6 +114,8 @@ pub struct Config {
     pub library: LibraryConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub download: DownloadConfig,
 }
 
 impl Config {

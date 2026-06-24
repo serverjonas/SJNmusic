@@ -23,6 +23,27 @@ pub struct Song {
     pub duration_secs: Option<f64>,
 }
 
+/// One row of the result set returned by `/search/yt`. Built directly from
+/// `yt-dlp -j ytsearchN:QUERY` JSON lines, so field names match what the
+/// GUI and the CLI consume. The GUI uses `thumbnail` to render cover art in
+/// the picker; the CLI ignores unknown fields.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct YtCandidate {
+    pub id: String,
+    pub title: String,
+    /// YouTube channel / uploader / artist — whichever yt-dlp fills in. The
+    /// CLI displays this verbatim; the daemon never tries to canonicalise it.
+    pub uploader: String,
+    /// yt-dlp's reported duration in seconds. `0.0` when unknown (livestreams,
+    /// shorts, etc.) so the CLI formatter still produces a sensible string.
+    pub duration_secs: f64,
+    pub url: String,
+    /// yt-dlp's reported thumbnail URL (highest-resolution pick if `thumbnails`
+    /// is a list of sizes). `None` when yt-dlp didn't include any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: i64,
@@ -74,6 +95,11 @@ pub struct DownloadJob {
     pub error: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
+    /// Source URL or `ytsearch1:NAME` string the worker will pass to yt-dlp.
+    /// Useful for debugging and for `/downloads` output once a picker is
+    /// involved. `None` for legacy `/init` callers that pass only a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// The in-memory mirror of the SQLite-backed state. Wrapped in a Mutex by
@@ -106,6 +132,10 @@ pub struct DaemonState {
     pub fuzzy_threshold: f64,
     /// 0 means unlimited.
     pub max_queue_size: usize,
+    /// Default number of yt-dlp candidates to return from `/search/yt` when
+    /// the caller doesn't specify `?limit=N`. Used by the CLI's interactive
+    /// picker.
+    pub search_count: usize,
 }
 
 impl DaemonState {
@@ -115,6 +145,7 @@ impl DaemonState {
         max_queue_size: usize,
         repeat_mode: RepeatMode,
         audio_handle: Arc<AudioHandle>,
+        search_count: usize,
     ) -> Self {
         let queue = Self::load_queue_from_db(&conn);
         info!("Restored queue with {} song(s) from DB", queue.len());
@@ -130,6 +161,7 @@ impl DaemonState {
             next_job_id: AtomicI64::new(1),
             fuzzy_threshold,
             max_queue_size,
+            search_count,
         }
     }
 
@@ -447,19 +479,18 @@ impl DaemonState {
     /// Synchronous yt-dlp + DB insert. Runs in a worker thread spawned by
     /// `init_async` and does NOT hold the daemon state mutex for the
     /// blocking subprocess call.
-    pub fn init_sync(&self, name: &str) -> Result<Song, String> {
+    ///
+    /// `name` is the canonical display/storage name; the file on disk is
+    /// derived from it via `paths::song_path`. `source` is the literal
+    /// argument handed to `yt-dlp` — either an explicit URL the user picked
+    /// from the search picker, or a `ytsearch1:NAME` expression for the
+    /// legacy auto-pick path.
+    pub fn init_sync(&self, name: &str, source: &str) -> Result<Song, String> {
         let path = song_path(name);
-        debug!("yt-dlp target path: {path}");
+        debug!("yt-dlp target path: {path} | source: {source}");
 
         let output = std::process::Command::new("yt-dlp")
-            .args([
-                "-x",
-                "--audio-format",
-                "mp3",
-                "-o",
-                &path,
-                &format!("ytsearch1:{name}"),
-            ])
+            .args(["-x", "--audio-format", "mp3", "-o", &path, source])
             .output();
 
         match output {
@@ -497,6 +528,77 @@ impl DaemonState {
             path,
             duration_secs: None,
         })
+    }
+
+    /// Fetch `limit` yt-dlp search candidates for `query` without downloading.
+    /// Returns parsed `YtCandidate` records. Bad JSON lines and yt-dlp
+    /// non-zero exit are tolerated as much as possible: an empty list is
+    /// returned when nothing parsed, while a yt-dlp startup failure surfaces
+    /// a descriptive error string so the CLI can show it to the user.
+    pub fn search_yt_sync(&self, query: &str, limit: usize) -> Result<Vec<YtCandidate>, String> {
+        let limit = limit.max(1);
+        let src = format!("ytsearch{limit}:{query}");
+        debug!("yt-dlp search: {src}");
+        let output = std::process::Command::new("yt-dlp")
+            .args(["--no-warnings", "-j", &src])
+            .output();
+        let out = match output {
+            Ok(o) => o,
+            Err(e) => {
+                error!("yt-dlp not available: {e}");
+                return Err(format!("yt-dlp unavailable: {e}"));
+            }
+        };
+        let mut results = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => {
+                    let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    let title = v
+                        .get("title")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let uploader = pick_uploader(&v);
+                    let duration_secs = v.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let url = v
+                        .get("webpage_url")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| v.get("url").and_then(|x| x.as_str()))
+                        .unwrap_or_default()
+                        .to_string();
+                    let thumbnail = pick_thumbnail(&v);
+                    if id.is_empty() || url.is_empty() {
+                        continue;
+                    }
+                    results.push(YtCandidate {
+                        id,
+                        title,
+                        uploader,
+                        duration_secs,
+                        url,
+                        thumbnail,
+                    });
+                }
+                Err(e) => {
+                    warn!("yt-dlp: skipping malformed JSON line: {e}");
+                }
+            }
+        }
+        // yt-dlp prints one JSON object per result. If it returned 0 objects
+        // AND a non-zero exit code, surface stderr so the CLI can show it.
+        if results.is_empty() && !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let msg = stderr.trim();
+            if !msg.is_empty() {
+                warn!("yt-dlp search produced no results and exited non-zero: {msg}");
+            }
+        }
+        Ok(results)
     }
 
     /// Clear the queue (memory + DB).
@@ -987,9 +1089,57 @@ fn unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Pick the best "artist / uploader" string for a yt-dlp JSON line.
+/// Prefer explicit `artist`, then `channel`, then `uploader`, then `creator`
+/// — falls back to an empty string so the CLI formatter doesn't have to
+/// special-case missing data.
+fn pick_uploader(v: &serde_json::Value) -> String {
+    for key in ["artist", "channel", "uploader", "creator"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Pick a thumbnail URL for a yt-dlp JSON line. Prefers the largest entry in
+/// the `thumbnails[]` array (when yt-dlp emits per-resolution variants);
+/// falls back to the singular `thumbnail` field. `None` is returned when
+/// yt-dlp shipped no cover art at all (rare, but possible for short-lived
+/// uploads or age-restricted items).
+fn pick_thumbnail(v: &serde_json::Value) -> Option<String> {
+    if let Some(arr) = v.get("thumbnails").and_then(|x| x.as_array()) {
+        let mut best: Option<(i64, &str)> = None;
+        for entry in arr {
+            let url = entry.get("url").and_then(|x| x.as_str());
+            let h = entry.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
+            if let Some(u) = url {
+                match best {
+                    Some((bh, _)) if bh >= h => {}
+                    _ => best = Some((h, u)),
+                }
+            }
+        }
+        if let Some((_, url)) = best {
+            return Some(url.to_string());
+        }
+    }
+    v.get("thumbnail")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Spawn a worker thread that downloads a song and updates the matching
 /// `DownloadJob`. Returns the assigned job id synchronously.
-pub fn init_async(state: &Arc<Mutex<DaemonState>>, name: String) -> i64 {
+///
+/// `name` is the display/storage name under which the song ends up in the
+/// library. `source` is the literal argument to pass to `yt-dlp` — either an
+/// explicit URL the user picked from `/search/yt` or `ytsearch1:NAME` for the
+/// legacy auto-pick path.
+pub fn init_async(state: &Arc<Mutex<DaemonState>>, name: String, source: String) -> i64 {
     let job_id = state
         .lock()
         .unwrap()
@@ -1004,6 +1154,7 @@ pub fn init_async(state: &Arc<Mutex<DaemonState>>, name: String) -> i64 {
         error: None,
         started_at: now,
         finished_at: None,
+        source: Some(source.clone()),
     };
     // Scope the locks so both MutexGuards drop together at the end of the
     // block. A temporary `state.lock()` at statement boundary would be
@@ -1019,7 +1170,9 @@ pub fn init_async(state: &Arc<Mutex<DaemonState>>, name: String) -> i64 {
     let arc = Arc::clone(state);
     std::thread::Builder::new()
         .name(format!("sjnmusic-dl-{job_id}"))
-        .spawn(move || run_download_job(arc, job_id, name_for_worker))
+        .spawn(move || {
+            run_download_job(arc, job_id, name_for_worker, source);
+        })
         .expect("failed to spawn download worker");
     debug!("Spawned download job {job_id} for {name}");
     job_id
@@ -1027,10 +1180,21 @@ pub fn init_async(state: &Arc<Mutex<DaemonState>>, name: String) -> i64 {
 
 /// Spawn one worker per name. Returns the assigned ids in the same order.
 pub fn init_batch(state: &Arc<Mutex<DaemonState>>, names: Vec<String>) -> Vec<i64> {
-    names.iter().map(|n| init_async(state, n.clone())).collect()
+    names
+        .iter()
+        .map(|n| {
+            let source = format!("ytsearch1:{n}");
+            init_async(state, n.clone(), source)
+        })
+        .collect()
 }
 
-fn run_download_job(state: Arc<Mutex<DaemonState>>, job_id: i64, name: String) {
+fn run_download_job(
+    state: Arc<Mutex<DaemonState>>,
+    job_id: i64,
+    name: String,
+    source: String,
+) {
     {
         let guard = state.lock().unwrap();
         let mut jobs = guard.download_jobs.lock().unwrap();
@@ -1038,7 +1202,7 @@ fn run_download_job(state: Arc<Mutex<DaemonState>>, job_id: i64, name: String) {
             j.status = "running".to_string();
         }
     }
-    let result = state.lock().unwrap().init_sync(&name);
+    let result = state.lock().unwrap().init_sync(&name, &source);
     {
         let guard = state.lock().unwrap();
         let mut jobs = guard.download_jobs.lock().unwrap();
