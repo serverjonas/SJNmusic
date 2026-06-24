@@ -36,12 +36,61 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Library / filesystem configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryConfig {
+    /// Directory where downloaded songs live. Defaults to
+    /// `$HOME/.sjn/music/songs`. May be absolute or relative to the config file.
+    #[serde(default)]
+    pub music_dir: Option<String>,
+    /// Maximum number of songs allowed in the playback queue. 0 = unlimited.
+    #[serde(default)]
+    pub max_queue_size: usize,
+    /// Default repeat mode used on daemon start: one of "off", "one", "all".
+    #[serde(default)]
+    pub default_repeat: String,
+}
+
+impl Default for LibraryConfig {
+    fn default() -> Self {
+        Self {
+            music_dir: None,
+            max_queue_size: 0,
+            default_repeat: "off".to_string(),
+        }
+    }
+}
+
+/// Controls how fuzzy search behaves and which routes /search and /search/all use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Jaro-Winkler score in [0.0, 1.0] below which fuzzy matches are rejected.
+    #[serde(default = "default_fuzzy")]
+    pub fuzzy_threshold: f64,
+}
+
+fn default_fuzzy() -> f64 {
+    0.65
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            fuzzy_threshold: default_fuzzy(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub library: LibraryConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 impl Config {

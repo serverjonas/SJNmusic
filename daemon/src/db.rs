@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use rusqlite::Connection;
 
 use crate::paths::{db_path, ensure_dirs};
@@ -18,9 +18,10 @@ pub fn open_db() -> Connection {
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS songs (
-            id   INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            path TEXT NOT NULL
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT UNIQUE NOT NULL,
+            path          TEXT NOT NULL,
+            duration_secs INTEGER
          );
 
         CREATE TABLE IF NOT EXISTS queue (
@@ -44,11 +45,46 @@ pub fn open_db() -> Connection {
          );
 
          CREATE INDEX IF NOT EXISTS idx_playlist_songs_pl
-             ON playlist_songs(playlist_id, position);",
+             ON playlist_songs(playlist_id, position);
+
+        CREATE TABLE IF NOT EXISTS history (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            song_id              INTEGER NOT NULL,
+            played_at            INTEGER NOT NULL,
+            duration_secs_played INTEGER NOT NULL,
+            FOREIGN KEY(song_id) REFERENCES songs(id) ON DELETE CASCADE
+         );
+
+        CREATE INDEX IF NOT EXISTS idx_history_played_at
+            ON history(played_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_history_song_id
+            ON history(song_id);",
     )
     .expect("Failed to create DB schema");
+
+    // Idempotent column migrations for older DBs created before
+    // `duration_secs` existed. SQLite raises a duplicate-column error which we
+    // swallow because the column already being present is exactly the intended
+    // post-condition of this step.
+    add_column_if_missing(&conn, "songs", "duration_secs", "INTEGER");
 
     debug!("Database initialized at {}", db_path());
     info!("Database ready");
     conn
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) {
+    let stmt = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+    match conn.execute_batch(&stmt) {
+        Ok(_) => info!("Added column {table}.{column}"),
+        Err(e) => {
+            // "duplicate column name: <name>" is the expected no-op signal.
+            let msg = e.to_string();
+            if msg.contains("duplicate column name") {
+                debug!("Column {table}.{column} already present");
+            } else {
+                warn!("Failed to add column {table}.{column}: {e}");
+            }
+        }
+    }
 }

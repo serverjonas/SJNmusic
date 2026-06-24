@@ -17,7 +17,8 @@ fn main() {
     log::info!("Loaded configuration");
     log::debug!("Config: {:?}", cfg);
 
-    paths::ensure_dirs();
+    paths::initialize(&cfg);
+
     daemon::run(cfg);
 }
 

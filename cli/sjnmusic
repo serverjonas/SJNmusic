@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,16 +40,33 @@ def build_parser() -> argparse.ArgumentParser:
     add_search_fields(sub.add_parser("play", help="search & start playing immediately"))
     add_search_fields(sub.add_parser("add", help="search & append to queue"))
     add_search_fields(sub.add_parser("del", help="search & delete from disk+db"))
-    add_search_fields(sub.add_parser("init", help="download via yt-dlp and register"))
-    add_search_fields(sub.add_parser("search", help="search the song database"))
+    add_search_fields(sub.add_parser("init", help="download via yt-dlp and register (async)"))
+    add_search_fields(sub.add_parser("search", help="search the song database (best match)"))
+    add_search_fields(sub.add_parser("search-all", help="search every match above threshold"))
 
     sub.add_parser("queue", help="show the current queue")
     sub.add_parser("now", help="alias for /now-playing")
+    sub.add_parser("status", help="one-line summary of current playback")
     sub.add_parser("skip", help="skip the next song")
+    sub.add_parser("pause", help="pause playback")
+    sub.add_parser("resume", help="resume playback")
+    sub.add_parser("shuffle", help="shuffle the queue in place")
     sub.add_parser("clear", help="empty the queue")
     sub.add_parser("songs", help="list all known songs")
     sub.add_parser("playlists", help="list all playlists")
+    sub.add_parser("downloads", help="list recent yt-dlp download jobs")
+    sub.add_parser("history", help="show recently played songs")
+    sub.add_parser("stats", help="aggregate stats from history")
     sub.add_parser("help", help="list HTTP endpoints")
+
+    vol = sub.add_parser("volume", help="get/set volume (0-100 or floating 0.0-2.0)")
+    vol.add_argument("value", nargs="?", type=float, help="0-100 (interpreted as percent)")
+
+    seek = sub.add_parser("seek", help="jump to position within the current track")
+    seek.add_argument("secs", type=float, help="position in seconds")
+
+    repeat = sub.add_parser("repeat", help="get/set repeat mode (off/one/all)")
+    repeat.add_argument("mode", nargs="?", help="off, one, all")
 
     pl_new = sub.add_parser("pl-new", help="create a playlist")
     pl_new.add_argument("name")
@@ -66,6 +84,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     pl_rm = sub.add_parser("pl-rm", help="delete a playlist")
     pl_rm.add_argument("name")
+
+    pl_rm_song = sub.add_parser("pl-rm-song", help="remove a song from a playlist")
+    pl_rm_song.add_argument("name")
+    pl_rm_song.add_argument("song_id", type=int)
+
+    pl_rename = sub.add_parser("pl-rename", help="rename a playlist")
+    pl_rename.add_argument("old")
+    pl_rename.add_argument("new")
+
+    pl_dup = sub.add_parser("pl-dup", help="duplicate a playlist under a new name")
+    pl_dup.add_argument("src")
+    pl_dup.add_argument("dest")
+
+    pl_reorder = sub.add_parser("pl-reorder", help="reorder songs in a playlist")
+    pl_reorder.add_argument("name")
+    pl_reorder.add_argument("from_pos", type=int)
+    pl_reorder.add_argument("to_pos", type=int)
+
+    init_batch = sub.add_parser("init-batch", help="batch-download several songs at once")
+    init_batch.add_argument("queries", nargs="+")
 
     return p
 
@@ -103,20 +141,91 @@ def call(host, port, method, route, body=None, query=None):
         sys.exit(2)
 
 
+def fmt_secs(s):
+    if s is None:
+        return "--:--"
+    try:
+        s = float(s)
+    except (TypeError, ValueError):
+        return "--:--"
+    if s < 0:
+        return "--:--"
+    m, sec = divmod(int(s), 60)
+    return f"{m:d}:{sec:02d}"
+
+
+def try_parse(payload):
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
 def print_response(args, status, payload):
     if args.json:
         print(f"HTTP {status}\n{payload}")
         return
-    try:
-        obj = json.loads(payload)
-    except json.JSONDecodeError:
+    obj = try_parse(payload)
+    if obj is None:
         print(f"HTTP {status}: {payload}")
         return
     if isinstance(obj, dict) and "error" in obj:
         print(f"error: {obj['error']}", file=sys.stderr)
         sys.exit(1)
-    if "queue" in obj and "current" in obj:
-        print("queue:")
+    # Specialised formatters used by status / history / stats / downloads.
+    if (
+        isinstance(obj, dict)
+        and "current" in obj
+        and "queue_len" in obj
+        and "elapsed_secs" in obj
+    ):
+        cur = obj.get("current") or {}
+        name = cur.get("name") or "(idle)"
+        elapsed = fmt_secs(obj.get("elapsed_secs"))
+        total = fmt_secs(obj.get("duration_secs"))
+        print(
+            f"[{cur.get('id', '-')}] {name}  {elapsed}/{total}  "
+            f"q={obj.get('queue_len', 0)}  "
+            f"vol={obj.get('volume', 0):.2f}  "
+            f"paused={obj.get('paused', False)}  "
+            f"repeat={obj.get('repeat', 'off')}"
+        )
+        return
+    if isinstance(obj, dict) and "history" in obj:
+        for h in obj["history"]:
+            ts = h.get("played_at", 0)
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            print(
+                f"{when}  [{h.get('song_id', '-')}] {h.get('song_name') or '(missing)'}  "
+                f"{fmt_secs(h.get('duration_secs_played', 0))}"
+            )
+        return
+    if isinstance(obj, dict) and "top_songs" in obj:
+        print(f"total plays: {obj.get('total_plays', 0)}")
+        print(f"total time:  {fmt_secs(obj.get('total_secs', 0))}")
+        for t in obj.get("top_songs", []):
+            print(
+                f"  - [{t.get('song_id', '-')}] {t.get('name') or '(missing)'}  "
+                f"plays={t.get('plays', 0)}  time={fmt_secs(t.get('total_secs', 0))}"
+            )
+        return
+    if isinstance(obj, dict) and "downloads" in obj:
+        for d in obj["downloads"]:
+            extras = []
+            if d.get("song_id") is not None:
+                extras.append(f"song={d['song_id']}")
+            if d.get("error"):
+                extras.append(f"err={d['error']}")
+            extra_str = ("  " + "  ".join(extras)) if extras else ""
+            print(f"[{d.get('id', '-')}] {d.get('status', '?')}  {d.get('name', '?')}{extra_str}")
+        return
+    if isinstance(obj, dict) and "matches" in obj:
+        for s in obj["matches"]:
+            print(f"[{s['id']}] {s['name']}")
+        return
+    if isinstance(obj, dict) and "queue" in obj and "current" in obj:
+        repeat = obj.get("repeat", "off")
+        print(f"queue (repeat={repeat}):")
         for s in obj.get("queue", []):
             print(f"  - [{s['id']}] {s['name']}")
         cur = obj.get("current")
@@ -125,15 +234,7 @@ def print_response(args, status, payload):
         else:
             print("now playing: (idle)")
         return
-    if "current" in obj and "queue_len" in obj:
-        cur = obj.get("current")
-        if cur:
-            print(f"now playing: [{cur['id']}] {cur['name']}")
-        else:
-            print("now playing: (idle)")
-        print(f"queue length: {obj['queue_len']}")
-        return
-    if "songs" in obj:
+    if isinstance(obj, dict) and "songs" in obj:
         for s in obj["songs"]:
             print(f"[{s['id']}] {s['name']}")
         return
@@ -174,6 +275,9 @@ def main(argv=None):
             body.setdefault("query", q)
         return body
 
+    def pl_route(name):
+        return f"/playlists/{urllib.parse.quote(name)}"
+
     if args.cmd == "play":
         status, payload = call(host, port, "POST", "/play", body=with_q(None))
     elif args.cmd == "add":
@@ -188,21 +292,58 @@ def main(argv=None):
             print("error: 'init' requires a song name", file=sys.stderr)
             sys.exit(2)
         status, payload = call(host, port, "POST", "/init", body={"song": q})
+    elif args.cmd == "init-batch":
+        status, payload = call(
+            host, port, "POST", "/init/batch", body={"songs": args.queries}
+        )
     elif args.cmd == "search":
         if not q:
             print("error: 'search' requires a query", file=sys.stderr)
             sys.exit(2)
         status, payload = call(host, port, "GET", "/search", query={"q": q})
+    elif args.cmd == "search-all":
+        if not q:
+            print("error: 'search-all' requires a query", file=sys.stderr)
+            sys.exit(2)
+        status, payload = call(host, port, "GET", "/search/all", query={"q": q})
     elif args.cmd == "queue":
         status, payload = call(host, port, "GET", "/queue")
-    elif args.cmd == "now":
+    elif args.cmd in ("now", "status"):
         status, payload = call(host, port, "GET", "/now-playing")
     elif args.cmd == "skip":
         status, payload = call(host, port, "POST", "/skip")
+    elif args.cmd == "pause":
+        status, payload = call(host, port, "POST", "/pause")
+    elif args.cmd == "resume":
+        status, payload = call(host, port, "POST", "/resume")
+    elif args.cmd == "seek":
+        status, payload = call(host, port, "POST", "/seek", body={"secs": args.secs})
+    elif args.cmd == "shuffle":
+        status, payload = call(host, port, "POST", "/queue/shuffle")
     elif args.cmd == "clear":
         status, payload = call(host, port, "POST", "/queue/clear")
     elif args.cmd == "songs":
         status, payload = call(host, port, "GET", "/songs")
+    elif args.cmd == "downloads":
+        status, payload = call(host, port, "GET", "/downloads")
+    elif args.cmd == "history":
+        status, payload = call(host, port, "GET", "/history")
+    elif args.cmd == "stats":
+        status, payload = call(host, port, "GET", "/stats")
+    elif args.cmd == "volume":
+        if args.value is None:
+            status, payload = call(host, port, "GET", "/volume")
+        else:
+            # Treat 0..100 as a percentage of rodio's default 1.0.
+            v = args.value
+            if v > 2.0:
+                v = v / 100.0
+            status, payload = call(host, port, "POST", "/volume", body={"vol": v})
+    elif args.cmd == "repeat":
+        if args.mode is None:
+            status, payload = call(host, port, "GET", "/repeat")
+        else:
+            status, payload = call(host, port, "POST", "/repeat", body={"mode": args.mode})
     elif args.cmd == "playlists":
         status, payload = call(host, port, "GET", "/playlists")
     elif args.cmd == "help":
@@ -210,20 +351,35 @@ def main(argv=None):
     elif args.cmd == "pl-new":
         status, payload = call(host, port, "POST", "/playlists", body={"name": args.name})
     elif args.cmd == "pl-show":
-        status, payload = call(host, port, "GET", f"/playlists/{urllib.parse.quote(args.name)}")
+        status, payload = call(host, port, "GET", pl_route(args.name))
     elif args.cmd == "pl-add":
         if not q:
             print("error: 'pl-add' requires a song query", file=sys.stderr)
             sys.exit(2)
         status, payload = call(
-            host, port, "POST",
-            f"/playlists/{urllib.parse.quote(args.name)}/add",
-            body={"query": q},
+            host, port, "POST", f"{pl_route(args.name)}/add", body={"query": q}
         )
     elif args.cmd == "pl-play":
-        status, payload = call(host, port, "POST", f"/playlists/{urllib.parse.quote(args.name)}/play")
+        status, payload = call(host, port, "POST", f"{pl_route(args.name)}/play")
     elif args.cmd == "pl-rm":
-        status, payload = call(host, port, "DELETE", f"/playlists/{urllib.parse.quote(args.name)}")
+        status, payload = call(host, port, "DELETE", pl_route(args.name))
+    elif args.cmd == "pl-rm-song":
+        status, payload = call(
+            host, port, "DELETE", f"{pl_route(args.name)}/songs/{args.song_id}"
+        )
+    elif args.cmd == "pl-rename":
+        status, payload = call(
+            host, port, "PATCH", pl_route(args.old), body={"name": args.new}
+        )
+    elif args.cmd == "pl-dup":
+        status, payload = call(
+            host, port, "POST", f"{pl_route(args.src)}/duplicate", body={"name": args.dest}
+        )
+    elif args.cmd == "pl-reorder":
+        status, payload = call(
+            host, port, "POST", f"{pl_route(args.name)}/reorder",
+            body={"from": args.from_pos, "to": args.to_pos},
+        )
     else:
         status, payload = call(host, port, "GET", "/help")
 

@@ -4,18 +4,27 @@ use std::thread;
 use log::{debug, error, info, warn};
 
 use crate::{
-    audio::AudioEngine,
+    audio::spawn_audio_thread,
     config::Config,
     db::open_db,
     server::start_server,
-    state::DaemonState,
+    state::{DaemonState, RepeatMode, Song},
 };
 
 pub fn run(cfg: Config) {
     info!("Starting sjnmusicd");
 
     let conn = open_db();
-    let state = Arc::new(Mutex::new(DaemonState::new(conn)));
+    let audio_handle = Arc::new(spawn_audio_thread());
+
+    let default_repeat = RepeatMode::parse(&cfg.library.default_repeat).unwrap_or(RepeatMode::Off);
+    let state = Arc::new(Mutex::new(DaemonState::new(
+        conn,
+        cfg.search.fuzzy_threshold,
+        cfg.library.max_queue_size,
+        default_repeat,
+        audio_handle,
+    )));
 
     // HTTP server thread.
     let server_state = state.clone();
@@ -30,70 +39,141 @@ pub fn run(cfg: Config) {
         error!("Failed to spawn HTTP server thread: {e}");
     }
 
-    // Audio playback loop (runs on the main thread).
-    let mut audio = AudioEngine::new();
     info!("Playback loop ready");
 
     loop {
-        {
-            let mut state = state.lock().unwrap();
-
-            // Clear "now playing" once the audio engine reports the song has
-            // ended so /now-playing and /queue reflect reality while the
-            // next iteration decides what's up next.
-            if !audio.is_playing() {
-                if let Some(prev) = state.current.take() {
-                    debug!("Playback finished for {}", prev.name);
-                }
-            }
-
-            if !state.queue.is_empty() && !audio.is_playing() {
-                // Snapshot the next song first, attempt audio.play, and only
-                // remove from the queue (memory + DB) when playback actually
-                // starts so decode/init failures don't silently lose it.
-                let next = state.queue[0].clone();
-                debug!("Starting playback: {} ({})", next.name, next.path);
-                match audio.play(&next.path) {
-                    Ok(()) => match state.pop_played() {
-                        Ok(Some(popped)) => {
-                            let name = popped.name.clone();
-                            state.current = Some(popped);
-                            debug!("DB queue row removed for {name}");
-                            info!("Now playing: {name}");
-                        }
-                        Ok(None) => {
-                            // Should not happen — we peeked a non-empty queue.
-                            state.current = Some(next.clone());
-                            warn!(
-                                "pop_played returned None after successful audio.play for {}",
-                                next.name
-                            );
-                        }
-                        Err(e) => {
-                            // pop_played is DB-first; on Err the in-memory
-                            // queue has NOT been mutated, so the song is
-                            // already at index 0 — do not re-insert or we
-                            // would duplicate it.
-                            error!(
-                                "Played {} but failed to update DB queue ({e}); \
-                                 leaving in-memory queue untouched",
-                                next.name
-                            );
-                            state.current = Some(next);
-                        }
-                    },
-                    Err(e) => {
-                        // The previous "now playing" is no longer accurate.
-                        state.current = None;
-                        error!(
-                            "Failed to play {} ({e}); leaving in queue",
-                            next.path
-                        );
-                    }
-                }
-            }
-        }
-
+        tick(&state);
         thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// One iteration of the playback loop. Pulled out so it can be unit-tested
+/// without a sleep or a network server.
+fn tick(state: &Arc<Mutex<DaemonState>>) {
+    let mut state = state.lock().unwrap();
+
+    // Single snapshot per tick — cheaper (one lock acquisition) and avoids
+    // races where the audio thread flips `playing` between two reads.
+    let snap = state.audio_handle.snapshot();
+
+    // 1) End-of-track / failed-play handling. We only decide what happened
+    // AFTER the audio thread has finished deciding things itself, i.e.
+    // `audio_pending_play == false`. The two outcomes we differentiate now:
+    //   - `snap.last_play_failed == true` ⇒ the `Play` command errored. We
+    //     drop `state.current` and pop the queue row, but we DON'T write a
+    //     history row (the song was never actually heard).
+    //   - `snap.last_play_failed == false` & `!snap.playing` & some time
+    //     elapsed ⇒ natural end-of-track. Record history with the elapsed
+    //     time and apply repeat-mode rules.
+    if state.current.is_some() && !snap.audio_pending_play {
+        if snap.last_play_failed {
+            let prev = state.current.take();
+            state.popped_for_current = false;
+            let _ = state.pop_played(None); // drop queue row, no history
+            if let Some(p) = prev {
+                debug!("audio: {} never actually played (setup failed)", p.name);
+                apply_repeat_after_end(&mut state, &p);
+            }
+        } else if !snap.playing {
+            if let Some(prev) = state.current.take() {
+                let played_secs = snap.elapsed_secs();
+                debug!(
+                    "Playback finished for {} (~{played_secs:.1}s)",
+                    prev.name
+                );
+                let _ = state.pop_played(Some(played_secs));
+                apply_repeat_after_end(&mut state, &prev);
+                state.popped_for_current = false;
+            }
+        }
+    }
+
+    // 2) Pop the queue row for the song we just kicked off, but only once
+    //    the audio thread confirmed it actually got the sink running. Until
+    //    then, we risk a double-pop if the play failed.
+    if state.current.is_some() && snap.playing && !state.popped_for_current {
+        let _ = state.pop_played(None); // drop queue row only, no history
+        state.popped_for_current = true;
+    }
+
+    // 3) Start the next song if the queue has one and the audio engine is
+    //    idle (idle = not playing AND not mid-setup).
+    if !state.queue.is_empty()
+        && !snap.playing
+        && !snap.audio_pending_play
+        && state.current.is_none()
+    {
+        let next = state.queue[0].clone();
+        debug!("Starting playback: {} ({})", next.name, next.path);
+        state.current = Some(next.clone());
+        state.popped_for_current = false;
+        state.audio_handle.send(crate::audio::AudioCmd::Play(next.path.clone()));
+    }
+}
+
+/// Apply repeat-mode rules after a track has ended and `pop_played` has
+/// already removed it from the queue.
+fn apply_repeat_after_end(state: &mut DaemonState, prev: &Song) {
+    match state.repeat_mode {
+        RepeatMode::Off => {
+            // `cycle_snapshot` is unused for Off; no need to update it.
+        }
+        RepeatMode::One => {
+            state.queue.push(prev.clone());
+            if let Err(e) = append_queue_row(state, prev.id) {
+                warn!("failed to re-queue {} for repeat-one: {e}", prev.name);
+            }
+            state.cycle_snapshot = state.queue.clone();
+        }
+        RepeatMode::All => {
+            if state.queue.is_empty() && !state.cycle_snapshot.is_empty() {
+                info!(
+                    "Repeat-all: refilling queue from snapshot ({} songs)",
+                    state.cycle_snapshot.len()
+                );
+                let snapshot = state.cycle_snapshot.clone();
+                if let Err(e) = refill_queue(state, &snapshot) {
+                    warn!("failed to refill queue for repeat-all: {e}");
+                }
+                state.queue = snapshot;
+            } else {
+                state.cycle_snapshot = state.queue.clone();
+            }
+        }
+    }
+}
+
+fn append_queue_row(state: &DaemonState, song_id: i64) -> rusqlite::Result<()> {
+    let conn = state.conn.lock().unwrap();
+    let next: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM queue",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO queue (position, song_id) VALUES (?1, ?2)",
+        rusqlite::params![next, song_id],
+    )?;
+    Ok(())
+}
+
+fn refill_queue(state: &DaemonState, snapshot: &[Song]) -> rusqlite::Result<()> {
+    let conn = state.conn.lock().unwrap();
+    conn.execute("DELETE FROM queue", [])?;
+    for s in snapshot {
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(position), 0) + 1 FROM queue",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+        conn.execute(
+            "INSERT INTO queue (position, song_id) VALUES (?1, ?2)",
+            rusqlite::params![next, s.id],
+        )?;
+    }
+    Ok(())
 }
