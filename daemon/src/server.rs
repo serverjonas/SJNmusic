@@ -249,6 +249,14 @@ fn handle(
                     Some(u) => u,
                     None => format!("ytsearch1:{song}"),
                 };
+                // Release the synchronous state guard BEFORE calling
+                // init_async — it re-locks the same `Arc<Mutex<DaemonState>>`
+                // from this very thread to register the new job and spawn
+                // the worker. `std::sync::Mutex` is not reentrant; without
+                // this drop the second `lock()` hangs tiny_http's single
+                // request thread, which in turn stalls every subsequent
+                // request (including /downloads polling in the GUI).
+                drop(state);
                 let id = init_async(&arc_for_async, song, source);
                 json_response(202, &serde_json::json!({
                     "job_id": id,
@@ -260,6 +268,10 @@ fn handle(
 
         Route::InitBatch => match songs_from_body(&body_text) {
             Ok(songs) => {
+                // Same reasoning as `/init`: init_batch → init_async, so
+                // the outer state guard must be released before we enter
+                // the helper.
+                drop(state);
                 let ids = init_batch(&arc_for_async, songs);
                 json_response(202, &serde_json::json!({
                     "job_ids": ids,
