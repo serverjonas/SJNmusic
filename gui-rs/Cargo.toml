@@ -1,0 +1,59 @@
+[package]
+name = "sjnmusic-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust GUI for sjnmusicd. HTTP remote control; owns no audio."
+license = "MIT"
+
+[dependencies]
+# Native window + immediate-mode GUI. `wayland`/`x11` are required to
+# bring `winit`'s platform features into scope on Linux; without them
+# winit 0.30 fails at compile time with "platform not supported".
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui  = "0.32"
+
+# Sync HTTP client (no async runtime needed for 1Hz polling).
+ureq = { version = "2.10", default-features = false, features = ["json"] }
+
+# Serde for daemon JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Thumbnail decoding for the yt-dlp search picker.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# System tray (with graceful runtime fallback for headless systems).
+# `default-features = false` opts out of tray-icon's `libxdo` sub-feature,
+# which would otherwise force a system link against `libxdo.so` (vendored
+# by xdotool on Arch, libxdo-dev on Debian). The GUI only uses menu
+# commands and never sets keyboard hotkey accelerators on tray items, so
+# we can safely skip the libxdo-sys dependency and pull in nothing extra
+# at link time. If we ever need global hotkeys, flip this back on and
+# ensure xdotool / libxdo-dev is installed.
+# `tray-icon` is OFF by default. It transitively pulls in
+# `libappindicator-sys`, which loads `libappindicator3.so` at runtime
+# via `dlopen`. If that .so is missing (Arch without
+# `libappindicator-gtk3`, fresh distros) the binary panics inside a
+# `Lazy::new` static initializer before our user-space `try_install`
+# can run. Enable with `cargo build --features tray` once the system
+# library is installed.
+tray-icon = { version = "0.21", default-features = false, optional = true }
+
+# Misc.
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"
+urlencoding = "2"
+
+# Features. `default = []` keeps the tray OUT of the default build so the
+# GUI launches on systems without `libappindicator-gtk3`. Opt back in
+# with `cargo build --features tray` (after installing the system lib).
+[features]
+default = []
+tray = ["dep:tray-icon"] # provides tray-icon, which pulls libappindicator-sys
+
+[profile.release]
+strip = true
+lto = "thin"
+opt-level = "z"
+codegen-units = 1
