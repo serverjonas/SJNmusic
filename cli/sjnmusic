@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_search_fields(sp):
         sp.add_argument("query", nargs="*", help="search text")
         sp.add_argument("-q", "--query", dest="query_flag", help="search text")
+        return sp
 
     add_search_fields(sub.add_parser("play", help="search & start playing immediately"))
     add_search_fields(sub.add_parser("add", help="search & append to queue"))
