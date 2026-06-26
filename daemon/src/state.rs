@@ -485,10 +485,26 @@ impl DaemonState {
     /// argument handed to `yt-dlp` — either an explicit URL the user picked
     /// from the search picker, or a `ytsearch1:NAME` expression for the
     /// legacy auto-pick path.
-    pub fn init_sync(&self, name: &str, source: &str) -> Result<Song, String> {
+    ///
+    /// Lives as an associated function (not an `&self` method) so callers
+    /// literally cannot keep the state mutex locked while `yt-dlp` runs.
+    /// Earlier revisions used `&self` here and were invoked as
+    /// `state.lock().unwrap().init_sync(...)`, which held the mutex for
+    /// the entire subprocess and froze every HTTP request (including the
+    /// GUI's `/now-playing` and `/downloads` polls and any subsequent
+    /// `/init` calls) until the download finished.
+    pub fn init_sync(
+        state: &Arc<Mutex<DaemonState>>,
+        name: &str,
+        source: &str,
+    ) -> Result<Song, String> {
         let path = song_path(name);
         debug!("yt-dlp target path: {path} | source: {source}");
 
+        // yt-dlp runs lock-free — the state mutex is NOT held during the
+        // blocking subprocess, so the HTTP server keeps serving other
+        // routes (downloads polling, search, play, …) while a song
+        // downloads in the background.
         let output = std::process::Command::new("yt-dlp")
             .args(["-x", "--audio-format", "mp3", "-o", &path, source])
             .output();
@@ -512,7 +528,12 @@ impl DaemonState {
             return Err(format!("download finished but file missing: {path}"));
         }
 
-        let conn = self.lock_conn();
+        // Acquire the state lock only briefly, for the DB inserts. The
+        // lock is never held across the `yt-dlp` call above. `.unwrap()`
+        // matches the rest of `state.rs`/`daemon.rs` and a poisoning
+        // here would mean the daemon is already unrecoverable.
+        let daemon = state.lock().unwrap();
+        let conn = daemon.lock_conn();
         let id = Self::insert_song(&conn, name, &path).map_err(|e| e.to_string())?;
         if let Some(secs) = probe_duration_secs(&path) {
             if let Err(e) = Self::update_duration_secs(&conn, id, secs) {
@@ -1202,7 +1223,12 @@ fn run_download_job(
             j.status = "running".to_string();
         }
     }
-    let result = state.lock().unwrap().init_sync(&name, &source);
+    // `init_sync` is now an associated function that manages its own
+    // locking: it runs `yt-dlp` lock-free and only grabs the state mutex
+    // for a brief DB insert at the end. Do NOT call it as
+    // `state.lock().unwrap().init_sync(...)` — that would re-introduce
+    // the freeze-while-downloading bug for both the CLI and the GUI.
+    let result = DaemonState::init_sync(&state, &name, &source);
     {
         let guard = state.lock().unwrap();
         let mut jobs = guard.download_jobs.lock().unwrap();
