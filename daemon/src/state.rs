@@ -556,7 +556,16 @@ impl DaemonState {
     /// non-zero exit are tolerated as much as possible: an empty list is
     /// returned when nothing parsed, while a yt-dlp startup failure surfaces
     /// a descriptive error string so the CLI can show it to the user.
-    pub fn search_yt_sync(&self, query: &str, limit: usize) -> Result<Vec<YtCandidate>, String> {
+    ///
+    /// Lives as an associated function (no `&self`) so the HTTP handler can
+    /// release the daemon state mutex before spawning yt-dlp. Earlier
+    /// revisions invoked this as `state.search_yt_sync(...)` *while*
+    /// holding the single-threaded `tiny_http` request handler's state
+    /// guard, which froze the entire daemon (including `/init`, `/queue`,
+    /// `/now-playing`) for the full duration of a yt-dlp search — typically
+    /// 30+ seconds on a slow network. Mirrors the lock-free pattern already
+    /// used for `init_sync` below.
+    pub fn search_yt_sync(query: &str, limit: usize) -> Result<Vec<YtCandidate>, String> {
         let limit = limit.max(1);
         let src = format!("ytsearch{limit}:{query}");
         debug!("yt-dlp search: {src}");

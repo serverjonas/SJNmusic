@@ -180,7 +180,15 @@ fn handle(
                     .get("limit")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(state.search_count);
-                match state.search_yt_sync(&q, limit) {
+                // Release the synchronous state guard BEFORE calling
+                // search_yt_sync — yt-dlp can take 30+ seconds on a slow
+                // network and holding the daemon mutex here would freeze
+                // every other endpoint (including the GUI's `/init`,
+                // `/downloads`, `/now-playing` polls) for the entire
+                // duration. Mirrors the drop-then-call pattern that
+                // `init_sync` already uses.
+                drop(state);
+                match DaemonState::search_yt_sync(&q, limit) {
                     Ok(results) => json_response(200, &serde_json::json!({
                         "query": q,
                         "limit": limit,

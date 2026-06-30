@@ -139,7 +139,7 @@ def join_query(args) -> str:
     return " ".join(parts).strip()
 
 
-def call(host, port, method, route, body=None, query=None):
+def call(host, port, method, route, body=None, query=None, timeout=15):
     qs = ""
     if query:
         qs = "?" + urllib.parse.urlencode(query)
@@ -153,7 +153,7 @@ def call(host, port, method, route, body=None, query=None):
     req = urllib.request.Request(url=url, data=data, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = resp.read().decode("utf-8")
             return resp.status, payload
     except urllib.error.HTTPError as e:
@@ -333,8 +333,13 @@ def main(argv=None):
             query = {"q": q}
             if limit is not None and limit > 0:
                 query["limit"] = str(limit)
+            # yt-dlp searches can easily take 30+ seconds on a slow network
+            # (the daemon calls `ytsearchN:QUERY -j` which hits YouTube).
+            # The default 15 s `urllib` timeout short-circuits the picker
+            # before the daemon even returns, so give this one endpoint a
+            # generous budget. All other endpoints keep the 15 s default.
             status, payload = call(
-                host, port, "GET", "/search/yt", query=query
+                host, port, "GET", "/search/yt", query=query, timeout=120
             )
             obj = try_parse(payload)
             results = (obj or {}).get("results") or []

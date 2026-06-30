@@ -330,12 +330,23 @@ impl DaemonClient {
     }
 
     pub fn search_yt(&self, q: &str, limit: usize) -> Result<Vec<YtCandidate>, DaemonError> {
+        // `/search/yt` shells out to `yt-dlp ytsearchN:...` on the daemon
+        // side, which can easily take 30+ seconds on a slow network — well
+        // past the agent's 8 s default. Override per-request so the picker
+        // doesn't ghost-fail with a transport timeout. All other
+        // endpoints keep the default; the daemon's state lock is no
+        // longer held during the search (see daemon state.rs), so other
+        // GETs (now-playing, downloads, queue) keep flowing while a
+        // search is in flight.
         Ok(self
-            .get::<SearchYtResult>(&format!(
-                "/search/yt?q={}&limit={}",
-                urlencoding::encode(q),
-                limit
-            ))?
+            .get_with_timeout::<SearchYtResult>(
+                &format!(
+                    "/search/yt?q={}&limit={}",
+                    urlencoding::encode(q),
+                    limit
+                ),
+                Duration::from_secs(120),
+            )?
             .results)
     }
 
@@ -484,7 +495,19 @@ impl DaemonClient {
     // ----------------------------------------------------------------
 
     fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, DaemonError> {
-        self._request_json("GET", path, None)
+        self._request_json("GET", path, None, None)
+    }
+
+    /// Like `get` but lets callers override the per-request timeout. Used
+    /// only for endpoints that back onto slow subprocess calls (currently
+    /// just `/search/yt`, since yt-dlp's first network round-trip can blow
+    /// past the 8 s agent default).
+    fn get_with_timeout<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<T, DaemonError> {
+        self._request_json("GET", path, None, Some(timeout))
     }
 
     fn post_json<T: for<'de> Deserialize<'de>>(
@@ -492,7 +515,7 @@ impl DaemonClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<T, DaemonError> {
-        self._request_json("POST", path, Some(body))
+        self._request_json("POST", path, Some(body), None)
     }
 
     fn patch<T: for<'de> Deserialize<'de>>(
@@ -500,7 +523,7 @@ impl DaemonClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<T, DaemonError> {
-        self._request_json("PATCH", path, Some(body))
+        self._request_json("PATCH", path, Some(body), None)
     }
 
     fn del_json<T: for<'de> Deserialize<'de>>(
@@ -508,11 +531,11 @@ impl DaemonClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<T, DaemonError> {
-        self._request_json("DELETE", path, Some(body))
+        self._request_json("DELETE", path, Some(body), None)
     }
 
     fn del<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, DaemonError> {
-        self._request_json("DELETE", path, None)
+        self._request_json("DELETE", path, None, None)
     }
 
     fn _request_json<T: for<'de> Deserialize<'de>>(
@@ -520,6 +543,7 @@ impl DaemonClient {
         method: &str,
         path: &str,
         body: Option<&serde_json::Value>,
+        timeout: Option<Duration>,
     ) -> Result<T, DaemonError> {
         let url = format!("{}{}", self.base, path);
         let req = match method {
@@ -534,6 +558,10 @@ impl DaemonClient {
                     other
                 )))
             }
+        };
+        let req = match timeout {
+            Some(t) => req.timeout(t),
+            None => req,
         };
         let req = match body {
             Some(b) => req.send_json(ureq::json!(b.clone())),
