@@ -17,7 +17,7 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui::TextureHandle;
 
-use crate::daemon::{DaemonClient, DownloadJob, HistoryEntry, NowPlaying, Playlist, QueueSnapshot, Song, Stats, YtCandidate};
+use crate::daemon::{DaemonClient, DownloadJob, HistoryEntry, NowPlaying, Playlist, QueueSnapshot, RankedCandidate, Song, Stats};
 use crate::state::{AppState, Route, Theme, TickMessage, Toast, ToastLevel};
 use crate::thumbnails::ImageMessage;
 use crate::tray::TraySignals;
@@ -48,7 +48,7 @@ pub struct SJNMusicApp {
     // them at the top of every `update()` so a quick typing burst can't
     // strand a result behind stale state.
     pub library_results_bus: Arc<std::sync::Mutex<Option<Vec<Song>>>>,
-    pub search_results_bus: Arc<std::sync::Mutex<Option<Vec<YtCandidate>>>>,
+    pub search_results_bus: Arc<std::sync::Mutex<Option<Vec<RankedCandidate>>>>,
 
     // Downloads view holds an explicit override so per-view refresh
     // overrides the polled snapshot without us racing the worker.
@@ -72,9 +72,14 @@ pub struct SJNMusicApp {
 
     pub search_q: String,
     pub search_limit: usize,
-    pub search_results: Vec<YtCandidate>,
+    pub search_results: Vec<RankedCandidate>,
     pub search_loading: bool,
     pub search_just_downloaded: Option<String>,
+    pub search_margin: i32,
+    /// Set while a Smart-Pick "auto" or "needs_choice" decision is in
+    /// flight so the UI can show "Picking…" instead of stale
+    /// `search_results` rows.
+    pub search_picking: bool,
 
     pub history_data: Vec<HistoryEntry>,
     pub history_loading: bool,
@@ -146,10 +151,12 @@ impl SJNMusicApp {
             new_playlist_name: String::new(),
 
             search_q: String::new(),
-            search_limit: 3,
+            search_limit: 9,
             search_results: Vec::new(),
             search_loading: false,
             search_just_downloaded: None,
+            search_margin: 30,
+            search_picking: false,
 
             history_data: Vec::new(),
             history_loading: false,

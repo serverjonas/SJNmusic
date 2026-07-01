@@ -47,6 +47,89 @@ pub struct YtCandidate {
     pub thumbnail: Option<String>,
 }
 
+/// Per-signal score that `GET /search/yt/ranked` attaches to every
+/// candidate. The daemon ranks by `score` and surfaces this
+/// breakdown for the GUI to render as badges / tooltips so the user
+/// sees *why* a particular result won.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScoreBreakdown {
+    pub total: i32,
+    #[serde(default)]
+    pub official_channel: i32,
+    #[serde(default)]
+    pub official_phrase: i32,
+    #[serde(default)]
+    pub title_match: i32,
+    #[serde(default)]
+    pub artist_match: i32,
+    #[serde(default)]
+    pub duration: i32,
+    #[serde(default)]
+    pub fan_upload: i32,
+    #[serde(default)]
+    pub lyrics: i32,
+    #[serde(default)]
+    pub reaction: i32,
+    #[serde(default)]
+    pub remix: i32,
+    #[serde(default)]
+    pub live: i32,
+    #[serde(default)]
+    pub spam: i32,
+    #[serde(default)]
+    pub instrumental: i32,
+    #[serde(default)]
+    pub karaoke: i32,
+}
+
+/// `GET /search/yt/ranked` candidate: a `YtCandidate` + score +
+/// detected flags (`official`, `lyrics`, `live`, `reaction`,
+/// `remix`, `nightcore`, etc.). Sorted server-side by `score`
+/// descending.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RankedCandidate {
+    pub id: String,
+    pub title: String,
+    pub uploader: String,
+    pub duration_secs: f64,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+    pub score: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<ScoreBreakdown>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+}
+
+/// `GET /pick` response. Tagged enum so the GUI can branch on the
+/// `kind` discriminator:
+/// - `auto` → proceeds straight to `/init` with `url`,
+/// - `needs_choice` → shows the picker (`candidates`),
+/// - `empty` → surfaces the error to the user.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PickResponse {
+    Auto {
+        url: String,
+        title: String,
+        uploader: String,
+        score: i32,
+        duration_secs: f64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        flags: Vec<String>,
+    },
+    NeedsChoice {
+        candidates: Vec<RankedCandidate>,
+        top_score: i32,
+        runner_up_score: i32,
+        margin: i32,
+    },
+    Empty {
+        message: String,
+    },
+}
+
 /// One persistent playlist with its member songs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Playlist {
@@ -163,6 +246,13 @@ pub struct SearchYtResult {
     pub query: String,
     pub limit: usize,
     pub results: Vec<YtCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchRankedResult {
+    pub query: String,
+    pub limit: usize,
+    pub results: Vec<RankedCandidate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -348,6 +438,49 @@ impl DaemonClient {
                 Duration::from_secs(120),
             )?
             .results)
+    }
+
+    pub fn search_yt_ranked(
+        &self,
+        q: &str,
+        limit: usize,
+    ) -> Result<Vec<RankedCandidate>, DaemonError> {
+        // `/search/yt/ranked` runs up to 3 variant `ytsearch` calls in
+        // parallel inside the daemon (raw, "official video",
+        // "official audio"), then dedupes and scores each candidate.
+        // Worst-case latency is dominated by the slowest single
+        // variant fetch, so we still budget ~180 s here.
+        Ok(self
+            .get_with_timeout::<SearchRankedResult>(
+                &format!(
+                    "/search/yt/ranked?q={}&limit={}",
+                    urlencoding::encode(q),
+                    limit
+                ),
+                Duration::from_secs(180),
+            )?
+            .results)
+    }
+
+    /// Auto-pick: returns either a single confidently-selected URL
+    /// or the ranked candidates for the picker. Same high timeout
+    /// as `search_yt_ranked` since the daemon does the same work.
+    pub fn pick(
+        &self,
+        q: &str,
+        limit: usize,
+        margin: Option<i32>,
+    ) -> Result<PickResponse, DaemonError> {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("q={}", urlencoding::encode(q)));
+        parts.push(format!("limit={limit}"));
+        if let Some(m) = margin {
+            parts.push(format!("margin={m}"));
+        }
+        self.get_with_timeout::<PickResponse>(
+            &format!("/pick?{}", parts.join("&")),
+            Duration::from_secs(180),
+        )
     }
 
     pub fn volume_info(&self) -> Result<VolumeInfo, DaemonError> {

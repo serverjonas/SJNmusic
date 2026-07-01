@@ -183,6 +183,176 @@ def try_parse(payload):
         return None
 
 
+def print_candidate(idx, c):
+    """Pretty-print one ranked candidate row for the picker."""
+    score = c.get("score")
+    score_str = f"score={score:+d}" if score is not None else ""
+    flags = " ".join(c.get("flags") or [])
+    flag_str = f" [{flags}]" if flags else ""
+    print(
+        f"[{idx}] {c.get('title', '?')}  --  "
+        f"{c.get('uploader') or '(unknown)':24}  "
+        f"({fmt_secs(c.get('duration_secs')):>5})  "
+        f"{score_str}{flag_str}"
+    )
+
+
+def interactive_pick(candidates):
+    """Show the picker; return the user's choice (or candidates[0])."""
+    for i, c in enumerate(candidates, 1):
+        print_candidate(i, c)
+    try:
+        raw = input("Pick a song [1]: ").strip()
+    except EOFError:
+        print(
+            "error: no input available; re-run with --auto or supply a piped number",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if raw == "":
+        return candidates[0]
+    try:
+        idx = int(raw) - 1
+    except ValueError:
+        print(f"error: not a number: {raw!r}", file=sys.stderr)
+        sys.exit(2)
+    if idx < 0 or idx >= len(candidates):
+        print(
+            f"error: choice out of range (1-{len(candidates)})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return candidates[idx]
+
+
+def legacy_pick(results, force_auto):
+    """Legacy /search/yt picker (no scoring fields)."""
+    if force_auto:
+        return results[0]
+    return interactive_pick(results)
+
+
+def do_init(args, host, port, q, force_pick, force_auto, limit):
+    """
+    Drive the `init` subcommand through the new ranked pipeline.
+
+    Default behaviour: `GET /pick?q=…` and let the daemon either
+    auto-select (when the top score beats the runner-up by margin) or
+    surface ranked candidates for the picker. Falls back to the legacy
+    `/search/yt` picker if the daemon doesn't speak `/pick` (older
+    builds), so the CLI stays forward/backward compatible.
+
+    Returns the chosen candidate dict (with at least a 'url' key) so
+    `main()` can dispatch the actual `/init` POST uniformly.
+    """
+    pick_query = {"q": q}
+    if limit is not None and limit > 0:
+        pick_query["limit"] = str(limit)
+    # 3 parallel yt-dlp fetches can easily take 30+ seconds each
+    # on a slow network; the daemon drops its state mutex before
+    # invoking them, but the network round-trips themselves are
+    # unchanged. Generous timeout to avoid ghost-failing.
+    pick_status, pick_payload = call(
+        host, port, "GET", "/pick", query=pick_query, timeout=180
+    )
+    pick_obj = try_parse(pick_payload)
+    if pick_status != 200 or pick_obj is None or "kind" not in pick_obj:
+        # Fall back to legacy `/search/yt` if the daemon is too old
+        # to know about `/pick`. Keeps the CLI working across daemon
+        # upgrades in either direction.
+        legacy_status, legacy_payload = call(
+            host, port, "GET", "/search/yt",
+            query=pick_query, timeout=120,
+        )
+        legacy_obj = try_parse(legacy_payload) or {}
+        legacy_results = legacy_obj.get("results") or []
+        if legacy_status != 200:
+            return (legacy_status, legacy_payload)
+        if not legacy_results:
+            print(
+                f"error: no yt-dlp results for {q!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return (
+            200,
+            json.dumps({"chosen": legacy_pick(legacy_results, force_auto)}),
+        )
+
+    kind = pick_obj["kind"]
+    if kind == "empty":
+        print(
+            f"error: no yt-dlp results for {q!r}: "
+            f"{pick_obj.get('message', '')}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if kind == "auto":
+        # Daemon is confident — surface the choice so the user sees
+        # what was picked, then download.
+        score = pick_obj.get("score", 0)
+        print(
+            f"[auto-pick score={score}] "
+            f"{pick_obj.get('title', '?')} -- "
+            f"{pick_obj.get('uploader', '(unknown)')}  "
+            f"({fmt_secs(pick_obj.get('duration_secs'))})"
+        )
+        if force_pick:
+            # `--pick` overrides the auto decision: ask the user.
+            ranked_status, ranked_payload = call(
+                host, port, "GET", "/search/yt/ranked",
+                query=pick_query, timeout=180,
+            )
+            ranked_obj = try_parse(ranked_payload) or {}
+            ranked_results = ranked_obj.get("results") or []
+            if ranked_status != 200 or not ranked_results:
+                print_response_args(args, ranked_status, ranked_payload)
+                sys.exit(1)
+            return (
+                200,
+                json.dumps({"chosen": interactive_pick(ranked_results)}),
+            )
+        return (
+            200,
+            json.dumps({
+                "chosen": {
+                    "url": pick_obj.get("url"),
+                    "title": pick_obj.get("title"),
+                    "uploader": pick_obj.get("uploader"),
+                    "score": score,
+                    "duration_secs": pick_obj.get("duration_secs"),
+                    "flags": pick_obj.get("flags", []),
+                },
+            }),
+        )
+    if kind == "needs_choice":
+        candidates = pick_obj.get("candidates") or []
+        if not candidates:
+            print(
+                f"error: no yt-dlp results for {q!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if force_auto:
+            chosen = candidates[0]
+            print(
+                f"[auto-pick score={chosen.get('score', 0)}] "
+                f"{chosen.get('title', '?')} -- "
+                f"{chosen.get('uploader', '(unknown)')}  "
+                f"({fmt_secs(chosen.get('duration_secs'))})"
+            )
+        else:
+            chosen = interactive_pick(candidates)
+        return (200, json.dumps({"chosen": chosen}))
+    print(f"error: unknown /pick kind {kind!r}", file=sys.stderr)
+    sys.exit(1)
+
+
+def print_response_args(args, status, payload):
+    """Helper for subroutes that already pre-formatted a payload."""
+    print_response(args, status, payload)
+
+
 def print_response(args, status, payload):
     if args.json:
         print(f"HTTP {status}\n{payload}")
@@ -315,82 +485,20 @@ def main(argv=None):
             sys.exit(2)
         force_pick = getattr(args, "pick", False)
         force_auto = getattr(args, "auto", False)
-        # `stdin_isatty` controls whether we *auto*-select (non-interactive)
-        # versus *prompt* the user. `--pick` overrides a non-TTY stdin so
-        # scripts can still drive the picker via a piped index if they want.
-        interactive = force_pick or (
-            sys.stdin.isatty() and not force_auto
+        limit = getattr(args, "limit", None)
+
+        # Drive the ranked pipeline (do_init returns the chosen
+        # candidate as a JSON envelope so we don't need separate
+        # branches below for `/init`).
+        _, envelope_payload = do_init(
+            args, host, port, q, force_pick, force_auto, limit,
         )
-        if not interactive:
-            # Legacy / scripted path: top result only, no round-trip for
-            # the candidate list. The daemon falls back to ytsearch1:NAME
-            # when no URL is supplied.
-            status, payload = call(
-                host, port, "POST", "/init", body={"song": q}
-            )
-        else:
-            limit = getattr(args, "limit", None)
-            query = {"q": q}
-            if limit is not None and limit > 0:
-                query["limit"] = str(limit)
-            # yt-dlp searches can easily take 30+ seconds on a slow network
-            # (the daemon calls `ytsearchN:QUERY -j` which hits YouTube).
-            # The default 15 s `urllib` timeout short-circuits the picker
-            # before the daemon even returns, so give this one endpoint a
-            # generous budget. All other endpoints keep the 15 s default.
-            status, payload = call(
-                host, port, "GET", "/search/yt", query=query, timeout=120
-            )
-            obj = try_parse(payload)
-            results = (obj or {}).get("results") or []
-            if status != 200:
-                print_response(args, status, payload)
-                sys.exit(1)
-            if not results:
-                print(
-                    f"error: no yt-dlp results for {q!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            for i, r in enumerate(results, 1):
-                uploader = r.get("uploader") or "(unknown)"
-                print(
-                    f"[{i}] {r.get('title', '?')}  --  {uploader}  "
-                    f"({fmt_secs(r.get('duration_secs'))})"
-                )
-            try:
-                raw = input("Pick a song [1]: ").strip()
-            except EOFError:
-                print(
-                    "error: no input available; re-run with --auto or supply a piped number",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-            if raw == "":
-                chosen_idx = 0
-            else:
-                try:
-                    chosen_idx = int(raw) - 1
-                except ValueError:
-                    print(
-                        f"error: not a number: {raw!r}",
-                        file=sys.stderr,
-                    )
-                    sys.exit(2)
-            if chosen_idx < 0 or chosen_idx >= len(results):
-                print(
-                    f"error: choice out of range (1-{len(results)})",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-            chosen = results[chosen_idx]
-            status, payload = call(
-                host,
-                port,
-                "POST",
-                "/init",
-                body={"name": q, "url": chosen.get("url") or ""},
-            )
+        chosen_obj = try_parse(envelope_payload) or {}
+        chosen = chosen_obj.get("chosen") or {}
+        status, payload = call(
+            host, port, "POST", "/init",
+            body={"name": q, "url": chosen.get("url") or ""},
+        )
     elif args.cmd == "init-batch":
         status, payload = call(
             host, port, "POST", "/init/batch", body={"songs": args.queries}

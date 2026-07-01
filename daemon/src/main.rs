@@ -6,6 +6,7 @@ mod mpris;
 mod paths;
 mod server;
 mod state;
+mod youtube;
 
 fn main() {
     // Initialise logging first so subsequent startup steps are visible.

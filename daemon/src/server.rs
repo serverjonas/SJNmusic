@@ -6,6 +6,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::audio::AudioCmd;
 use crate::state::{init_async, init_batch, DaemonState, RepeatMode};
+use crate::youtube::{pick_best, rank_query, AUTO_PICK_MARGIN};
 
 #[derive(Serialize)]
 struct ApiError {
@@ -83,7 +84,9 @@ fn handle(
                 "GET  /songs?q=",
                 "GET  /search?q=... (best match) or POST /search {query}",
                 "GET  /search/all?q=... (every match above threshold)",
-                "GET  /search/yt?q=...&limit=N (yt-dlp candidates for picker)",
+                "GET  /search/yt?q=...&limit=N (raw yt-dlp candidates for picker)",
+                "GET  /search/yt/ranked?q=...&limit=N (scored + sorted candidates; re-ranks 3 query variants)",
+                "GET  /pick?q=...&limit=N&margin=N (auto-pick when top score > runner-up by margin, otherwise returns candidates)",
                 "GET  /queue",
                 "GET  /now-playing",
                 "GET  /downloads",
@@ -194,6 +197,48 @@ fn handle(
                         "limit": limit,
                         "results": results,
                     })),
+                    Err(e) => error_response(e),
+                }
+            }
+            Err(e) => error_response(e),
+        },
+
+        Route::SearchYtRanked => match query_or_body(&query_params, &body_text) {
+            Ok(q) => {
+                let limit = query_params
+                    .get("limit")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(state.search_count);
+                // Same lock-drop reasoning as `/search/yt` — parallel
+                // yt-dlp invocations can reach 30s+ each before they
+                // return, and we don't want to keep the state mutex for
+                // the duration.
+                drop(state);
+                match rank_query(&q, limit) {
+                    Ok(ranked) => json_response(200, &serde_json::json!({
+                        "query": q,
+                        "limit": limit,
+                        "results": ranked,
+                    })),
+                    Err(e) => error_response(e),
+                }
+            }
+            Err(e) => error_response(e),
+        },
+
+        Route::Pick => match query_or_body(&query_params, &body_text) {
+            Ok(q) => {
+                let limit = query_params
+                    .get("limit")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(state.search_count);
+                let margin = query_params
+                    .get("margin")
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(AUTO_PICK_MARGIN);
+                drop(state);
+                match pick_best(&q, limit, margin) {
+                    Ok(resp) => json_response(200, &resp),
                     Err(e) => error_response(e),
                 }
             }
@@ -483,6 +528,8 @@ enum Route {
     Search,
     SearchAll,
     SearchYt,
+    SearchYtRanked,
+    Pick,
     Queue,
     NowPlaying,
     Downloads,
@@ -521,6 +568,8 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Get, "/songs") => Route::Songs,
         (m, "/search") if matches!(m, Method::Get | Method::Post) => Route::Search,
         (Method::Get, "/search/all") => Route::SearchAll,
+        (Method::Get, "/search/yt/ranked") => Route::SearchYtRanked,
+        (Method::Get, "/pick") => Route::Pick,
         (Method::Get, "/search/yt") => Route::SearchYt,
         (Method::Get, "/queue") => Route::Queue,
         (Method::Get, "/now-playing") => Route::NowPlaying,
