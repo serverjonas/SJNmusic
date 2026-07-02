@@ -56,13 +56,13 @@ cli/sjnmusic songs
 Play a song:
 
 ```bash
-cli/sjnmusic play "Haftbefehl - RADW"
+cli/sjnmusic play "song from my libary"
 ```
 
 Create a playlist:
 
 ```bash
-cli/sjnmusic pl-new "Deutschrap"
+cli/sjnmusic pl-new "favourites"
 ```
 
 Show playback status:
