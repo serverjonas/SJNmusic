@@ -29,6 +29,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.environ.get("SJNMUSIC_PORT", str(DEFAULT_PORT))),
     )
+    p.add_argument(
+        "--token",
+        default=os.environ.get("SJNMUSIC_TOKEN"),
+        help=(
+            "bearer token for the daemon (Authorization: Bearer <token>). "
+            "Required when talking to a non-loopback daemon. Can also be set "
+            "via the SJNMUSIC_TOKEN environment variable. On loopback the "
+            "CLI auto-discovers the token from GET /auth/token."
+        ),
+    )
     p.add_argument("--json", action="store_true", help="print raw JSON responses")
 
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -139,18 +149,18 @@ def join_query(args) -> str:
     return " ".join(parts).strip()
 
 
-def call(host, port, method, route, body=None, query=None, timeout=15):
+def call(host, port, method, route, body=None, query=None, timeout=15, headers=None):
     qs = ""
     if query:
         qs = "?" + urllib.parse.urlencode(query)
     url = f"http://{host}:{port}{route}{qs}"
 
     data = None
-    headers = {}
+    hdrs = dict(headers or {})
     if body is not None:
         data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url=url, data=data, headers=headers, method=method)
+        hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url=url, data=data, headers=hdrs, method=method)
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -161,6 +171,107 @@ def call(host, port, method, route, body=None, query=None, timeout=15):
     except urllib.error.URLError as e:
         print(f"error: cannot reach daemon at {url}: {e.reason}", file=sys.stderr)
         sys.exit(2)
+
+
+# Loopback addresses that skip the bearer-token check on the daemon
+# side. Kept in sync with the daemon's `auth::is_local_request` so the
+# CLI auto-fetch fallback only ever fires when the daemon would
+# actually let us through unauthenticated.
+LOCAL_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def is_local(host):
+    return host in LOCAL_HOSTS
+
+
+def fetch_token(host, port, timeout=5):
+    """
+    Best-effort localhost-only token probe.
+
+    GET /auth/token is itself loopback-only on the daemon side, so
+    reaching it implies we're a process running on the same host. We
+    do NOT retry on failure — a 403 here means a remote daemon is
+    pretending to be local and refusing (we should propagate the
+    error), a 404 means the daemon has auth disabled (don't auto-fetch
+    any token), and any other non-200 is opaque. We surface the
+    decoded JSON `token` field on success and `None` on every other
+    outcome.
+    """
+    try:
+        status, payload = call(
+            host, port, "GET", "/auth/token", timeout=timeout
+        )
+    except SystemExit:
+        # `call` exits the process on URLError; treat that as
+        # "couldn't reach daemon, no token". We re-raise because the
+        # caller is already going to error out on the original
+        # request anyway, but only after a transparent re-raise so
+        # surfacing happens at the right stack frame.
+        return None
+    if status != 200:
+        return None
+    obj = try_parse(payload)
+    if not isinstance(obj, dict):
+        return None
+    tok = obj.get("token")
+    if isinstance(tok, str) and tok:
+        return tok
+    return None
+
+
+def request(args, host, port, method, route, body=None, query=None, timeout=15):
+    """
+    Auth-aware wrapper around `call`. Order of operations:
+
+    1. If the operator supplied `--token` (or `SJNMUSIC_TOKEN`), attach
+       `Authorization: Bearer <token>` and send straight to the
+       daemon. We never auto-fetch on top of an explicit token — that
+       would silently swap a user-supplied secret with the daemon's
+       current one (which is rarely what an operator wants).
+    2. Otherwise: if the peer is loopback, send without a token and
+       then, if the daemon rejected with 401, do a one-shot
+       `GET /auth/token` and retry. This keeps today's CLI workflows
+       unchanged: a user with auto-fetch works even though the
+       daemon now requires tokens for non-loopback callers. We
+       decline to silently fetch on a non-loopback host because that
+       would defeat the whole point of forcing operators to give an
+       explicit token to remote daemons.
+    3. If the peer is non-loopback and no token was supplied, the
+       call proceeds without a header so the operator gets a
+       daemon-issued 401 instead of a CLI-level error — easier to
+       debug in the daemon logs.
+    """
+    explicit_token = getattr(args, "token", None) or ""
+    hdrs = {}
+    if explicit_token:
+        hdrs["Authorization"] = f"Bearer {explicit_token}"
+
+    status, payload = call(
+        host, port, method, route, body=body, query=query,
+        timeout=timeout, headers=hdrs,
+    )
+
+    # Auto-fetch only on FIRST observation of 401 on a loopback peer
+    # when no explicit token was supplied AND this is not already the
+    # token endpoint itself (which would obviously never require a
+    # token). The 401 must have come from a request method that the
+    # server would normally respond 2xx to without auth; if /auth/token
+    # is what we just hit, we'd loop forever.
+    if (
+        status == 401
+        and not explicit_token
+        and is_local(host)
+        and route != "/auth/token"
+    ):
+        fetched = fetch_token(host, port)
+        if fetched:
+            hdrs["Authorization"] = f"Bearer {fetched}"
+            status, payload = call(
+                host, port, method, route, body=body, query=query,
+                timeout=timeout, headers=hdrs,
+            )
+
+    return status, payload
 
 
 def fmt_secs(s):
@@ -252,16 +363,16 @@ def do_init(args, host, port, q, force_pick, force_auto, limit):
     # on a slow network; the daemon drops its state mutex before
     # invoking them, but the network round-trips themselves are
     # unchanged. Generous timeout to avoid ghost-failing.
-    pick_status, pick_payload = call(
-        host, port, "GET", "/pick", query=pick_query, timeout=180
+    pick_status, pick_payload = request(
+        args, host, port, "GET", "/pick", query=pick_query, timeout=180
     )
     pick_obj = try_parse(pick_payload)
     if pick_status != 200 or pick_obj is None or "kind" not in pick_obj:
         # Fall back to legacy `/search/yt` if the daemon is too old
         # to know about `/pick`. Keeps the CLI working across daemon
         # upgrades in either direction.
-        legacy_status, legacy_payload = call(
-            host, port, "GET", "/search/yt",
+        legacy_status, legacy_payload = request(
+            args, host, port, "GET", "/search/yt",
             query=pick_query, timeout=120,
         )
         legacy_obj = try_parse(legacy_payload) or {}
@@ -299,8 +410,8 @@ def do_init(args, host, port, q, force_pick, force_auto, limit):
         )
         if force_pick:
             # `--pick` overrides the auto decision: ask the user.
-            ranked_status, ranked_payload = call(
-                host, port, "GET", "/search/yt/ranked",
+            ranked_status, ranked_payload = request(
+                args, host, port, "GET", "/search/yt/ranked",
                 query=pick_query, timeout=180,
             )
             ranked_obj = try_parse(ranked_payload) or {}
@@ -471,14 +582,14 @@ def main(argv=None):
         return f"/playlists/{urllib.parse.quote(name)}"
 
     if args.cmd == "play":
-        status, payload = call(host, port, "POST", "/play", body=with_q(None))
+        status, payload = request(args, host, port, "POST", "/play", body=with_q(None))
     elif args.cmd == "add":
-        status, payload = call(host, port, "POST", "/add", body=with_q(None))
+        status, payload = request(args, host, port, "POST", "/add", body=with_q(None))
     elif args.cmd == "del":
         if not q:
             print("error: 'del' requires a search query", file=sys.stderr)
             sys.exit(2)
-        status, payload = call(host, port, "POST", "/del", body=with_q(None))
+        status, payload = request(args, host, port, "POST", "/del", body=with_q(None))
     elif args.cmd == "init":
         if not q:
             print("error: 'init' requires a song name", file=sys.stderr)
@@ -489,106 +600,108 @@ def main(argv=None):
 
         # Drive the ranked pipeline (do_init returns the chosen
         # candidate as a JSON envelope so we don't need separate
-        # branches below for `/init`).
+        # branches below for `/init`). Routing through `request`
+        # means auto-fetch-from-/auth/token also works for the
+        # search (/pick) and the eventual /init POST.
         _, envelope_payload = do_init(
             args, host, port, q, force_pick, force_auto, limit,
         )
         chosen_obj = try_parse(envelope_payload) or {}
         chosen = chosen_obj.get("chosen") or {}
-        status, payload = call(
-            host, port, "POST", "/init",
+        status, payload = request(
+            args, host, port, "POST", "/init",
             body={"name": q, "url": chosen.get("url") or ""},
         )
     elif args.cmd == "init-batch":
-        status, payload = call(
-            host, port, "POST", "/init/batch", body={"songs": args.queries}
+        status, payload = request(
+            args, host, port, "POST", "/init/batch", body={"songs": args.queries}
         )
     elif args.cmd == "search":
         if not q:
             print("error: 'search' requires a query", file=sys.stderr)
             sys.exit(2)
-        status, payload = call(host, port, "GET", "/search", query={"q": q})
+        status, payload = request(args, host, port, "GET", "/search", query={"q": q})
     elif args.cmd == "search-all":
         if not q:
             print("error: 'search-all' requires a query", file=sys.stderr)
             sys.exit(2)
-        status, payload = call(host, port, "GET", "/search/all", query={"q": q})
+        status, payload = request(args, host, port, "GET", "/search/all", query={"q": q})
     elif args.cmd == "queue":
-        status, payload = call(host, port, "GET", "/queue")
+        status, payload = request(args, host, port, "GET", "/queue")
     elif args.cmd in ("now", "status"):
-        status, payload = call(host, port, "GET", "/now-playing")
+        status, payload = request(args, host, port, "GET", "/now-playing")
     elif args.cmd == "skip":
-        status, payload = call(host, port, "POST", "/skip")
+        status, payload = request(args, host, port, "POST", "/skip")
     elif args.cmd == "pause":
-        status, payload = call(host, port, "POST", "/pause")
+        status, payload = request(args, host, port, "POST", "/pause")
     elif args.cmd == "resume":
-        status, payload = call(host, port, "POST", "/resume")
+        status, payload = request(args, host, port, "POST", "/resume")
     elif args.cmd == "seek":
-        status, payload = call(host, port, "POST", "/seek", body={"secs": args.secs})
+        status, payload = request(args, host, port, "POST", "/seek", body={"secs": args.secs})
     elif args.cmd == "shuffle":
-        status, payload = call(host, port, "POST", "/queue/shuffle")
+        status, payload = request(args, host, port, "POST", "/queue/shuffle")
     elif args.cmd == "clear":
-        status, payload = call(host, port, "POST", "/queue/clear")
+        status, payload = request(args, host, port, "POST", "/queue/clear")
     elif args.cmd == "songs":
-        status, payload = call(host, port, "GET", "/songs")
+        status, payload = request(args, host, port, "GET", "/songs")
     elif args.cmd == "downloads":
-        status, payload = call(host, port, "GET", "/downloads")
+        status, payload = request(args, host, port, "GET", "/downloads")
     elif args.cmd == "history":
-        status, payload = call(host, port, "GET", "/history")
+        status, payload = request(args, host, port, "GET", "/history")
     elif args.cmd == "stats":
-        status, payload = call(host, port, "GET", "/stats")
+        status, payload = request(args, host, port, "GET", "/stats")
     elif args.cmd == "volume":
         if args.value is None:
-            status, payload = call(host, port, "GET", "/volume")
+            status, payload = request(args, host, port, "GET", "/volume")
         else:
             # Treat 0..100 as a percentage of rodio's default 1.0.
             v = args.value
             if v > 2.0:
                 v = v / 100.0
-            status, payload = call(host, port, "POST", "/volume", body={"vol": v})
+            status, payload = request(args, host, port, "POST", "/volume", body={"vol": v})
     elif args.cmd == "repeat":
         if args.mode is None:
-            status, payload = call(host, port, "GET", "/repeat")
+            status, payload = request(args, host, port, "GET", "/repeat")
         else:
-            status, payload = call(host, port, "POST", "/repeat", body={"mode": args.mode})
+            status, payload = request(args, host, port, "POST", "/repeat", body={"mode": args.mode})
     elif args.cmd == "playlists":
-        status, payload = call(host, port, "GET", "/playlists")
+        status, payload = request(args, host, port, "GET", "/playlists")
     elif args.cmd == "help":
-        status, payload = call(host, port, "GET", "/help")
+        status, payload = request(args, host, port, "GET", "/help")
     elif args.cmd == "pl-new":
-        status, payload = call(host, port, "POST", "/playlists", body={"name": args.name})
+        status, payload = request(args, host, port, "POST", "/playlists", body={"name": args.name})
     elif args.cmd == "pl-show":
-        status, payload = call(host, port, "GET", pl_route(args.name))
+        status, payload = request(args, host, port, "GET", pl_route(args.name))
     elif args.cmd == "pl-add":
         if not q:
             print("error: 'pl-add' requires a song query", file=sys.stderr)
             sys.exit(2)
-        status, payload = call(
-            host, port, "POST", f"{pl_route(args.name)}/add", body={"query": q}
+        status, payload = request(
+            args, host, port, "POST", f"{pl_route(args.name)}/add", body={"query": q}
         )
     elif args.cmd == "pl-play":
-        status, payload = call(host, port, "POST", f"{pl_route(args.name)}/play")
+        status, payload = request(args, host, port, "POST", f"{pl_route(args.name)}/play")
     elif args.cmd == "pl-rm":
-        status, payload = call(host, port, "DELETE", pl_route(args.name))
+        status, payload = request(args, host, port, "DELETE", pl_route(args.name))
     elif args.cmd == "pl-rm-song":
-        status, payload = call(
-            host, port, "DELETE", f"{pl_route(args.name)}/songs/{args.song_id}"
+        status, payload = request(
+            args, host, port, "DELETE", f"{pl_route(args.name)}/songs/{args.song_id}"
         )
     elif args.cmd == "pl-rename":
-        status, payload = call(
-            host, port, "PATCH", pl_route(args.old), body={"name": args.new}
+        status, payload = request(
+            args, host, port, "PATCH", pl_route(args.old), body={"name": args.new}
         )
     elif args.cmd == "pl-dup":
-        status, payload = call(
-            host, port, "POST", f"{pl_route(args.src)}/duplicate", body={"name": args.dest}
+        status, payload = request(
+            args, host, port, "POST", f"{pl_route(args.src)}/duplicate", body={"name": args.dest}
         )
     elif args.cmd == "pl-reorder":
-        status, payload = call(
-            host, port, "POST", f"{pl_route(args.name)}/reorder",
+        status, payload = request(
+            args, host, port, "POST", f"{pl_route(args.name)}/reorder",
             body={"from": args.from_pos, "to": args.to_pos},
         )
     else:
-        status, payload = call(host, port, "GET", "/help")
+        status, payload = request(args, host, port, "GET", "/help")
 
     print_response(args, status, payload)
 

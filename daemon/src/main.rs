@@ -1,4 +1,5 @@
 mod audio;
+mod auth;
 mod config;
 mod daemon;
 mod db;

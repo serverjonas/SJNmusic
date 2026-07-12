@@ -16,6 +16,11 @@ env_logger = "0.11"
 toml = "0.8"
 percent-encoding = "2"
 rand = "0.8"
+# `base64` is used by the optional bearer-token authentication module
+# (`auth.rs`) to encode the 32 random bytes of `auth_token` into a 43-char
+# URL-safe string that fits comfortably in an HTTP header. Pull the URL-safe
+# alphabet (no padding) so the value needs no further quoting.
+base64 = "0.22"
 # `zbus` exposes an org.mpris.MediaPlayer2.sjnmusic service so Linux DEs and
 # media-key daemons can control the daemon even when the GUI process is
 # closed. We run zbus inside a single-threaded tokio runtime hosted by the

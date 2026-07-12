@@ -5,6 +5,7 @@ use log::{debug, error, info, warn};
 
 use crate::{
     audio::spawn_audio_thread,
+    auth,
     config::Config,
     db::open_db,
     mpris,
@@ -12,8 +13,94 @@ use crate::{
     state::{DaemonState, RepeatMode, Song},
 };
 
-pub fn run(cfg: Config) {
+/// Returns `true` when the bind host is a loopback interface
+/// (`127.0.0.1`, `::1`, or the conventional `localhost` string). Used by
+/// the startup warning paths to decide whether to alert the operator
+/// about exposing the daemon on a network-reachable address.
+fn bind_is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+fn warn_if_publicly_exposed(host: &str, auth_on: bool) {
+    if bind_is_loopback(host) {
+        return;
+    }
+    if auth_on {
+        warn!(
+            "sjnmusicd is listening on {host}; remote peers require the configured bearer token (Authorization: Bearer <token>)"
+        );
+    } else {
+        warn!(
+            "sjnmusicd is listening on {host} WITHOUT authentication; anyone on the network can control playback"
+        );
+        // Mirror the warning to stderr so the operator sees it even
+        // when they start the daemon interactively without a log file
+        // and without RUST_LOG configured. env_logger's default filter
+        // ("info") would already include the warn! above, but historical
+        // service-launch recipes often run sjnmusicd via a unit-file
+        // and pipe stdout to /dev/null — belt and braces for safety.
+        eprintln!(
+            "WARNING: sjnmusicd is listening on {host} WITHOUT authentication. \
+             Anyone on the network can control playback. \
+             Set auth_enabled = true in {} (alongside any auth_token you want to use) to require bearer tokens.",
+            crate::paths::config_path(),
+        );
+    }
+}
+
+/// Build the effective bearer-token the HTTP server should use for
+/// the lifetime of this process. Behaviour matches the design spec:
+///
+/// * `auth_enabled = false` ⇒ authentication is off entirely.
+///   Token returned is `None`, regardless of any leftover config value.
+/// * `auth_enabled = true && auth_token == ""` ⇒ generate a fresh
+///   32-byte URL-safe base64 token, persist it to disk so the next
+///   startup keeps using the same one, and return it.
+/// * `auth_enabled = true && auth_token != ""` ⇒ reuse what the
+///   operator already configured. We do NOT validate the token's
+///   content (e.g. base64-ness) at boot — if it's malformed,
+///   `request_is_authorized` will simply never match and any remote
+///   caller will see 401. That's safe: a wrong token != a correct
+///   token to a constant-time comparator.
+///
+/// Returns `Some(token)` when auth is on, `None` otherwise. The
+/// caller decides whether to emit startup warnings based on whether
+/// the daemon is exposed on a non-loopback address.
+fn resolve_auth_token(cfg: &mut Config) -> Option<String> {
+    if !cfg.auth_enabled {
+        return None;
+    }
+    if !cfg.auth_token.is_empty() {
+        info!(
+            "Authentication enabled; using configured auth_token (length {})",
+            cfg.auth_token.len()
+        );
+        return Some(cfg.auth_token.clone());
+    }
+    let token = auth::generate_token();
+    info!(
+        "Authentication enabled; generated new auth_token (length {}). Use `sjnmusic --host 127.0.0.1 GET /auth/token` to read it.",
+        token.len()
+    );
+    cfg.auth_token = token.clone();
+    match cfg.save() {
+        Ok(()) => info!(
+            "Persisted new auth_token to {} so restarts keep using the same token.",
+            crate::paths::config_path()
+        ),
+        Err(e) => warn!(
+            "Failed to persist new auth_token to {}: {e}. Token will rotate on every restart until the file becomes writable.",
+            crate::paths::config_path()
+        ),
+    }
+    Some(token)
+}
+
+pub fn run(mut cfg: Config) {
     info!("Starting sjnmusicd");
+
+    let auth_token = resolve_auth_token(&mut cfg);
+    warn_if_publicly_exposed(&cfg.server.host, auth_token.is_some());
 
     let conn = open_db();
     let audio_handle = Arc::new(spawn_audio_thread());
@@ -35,7 +122,7 @@ pub fn run(cfg: Config) {
     let server_handle = thread::Builder::new()
         .name("sjnmusic-http".into())
         .spawn(move || {
-            start_server(server_state, &host, port);
+            start_server(server_state, &host, port, auth_token);
         });
     if let Err(e) = server_handle {
         error!("Failed to spawn HTTP server thread: {e}");

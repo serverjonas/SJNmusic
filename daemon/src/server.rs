@@ -5,6 +5,7 @@ use serde::Serialize;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::audio::AudioCmd;
+use crate::auth;
 use crate::state::{init_async, init_batch, DaemonState, RepeatMode};
 use crate::youtube::{pick_best, rank_query, AUTO_PICK_MARGIN};
 
@@ -37,12 +38,24 @@ fn parse_body(body: &str) -> serde_json::Result<serde_json::Value> {
     }
 }
 
-pub fn start_server(state: Arc<Mutex<DaemonState>>, host: &str, port: u16) {
+pub fn start_server(
+    state: Arc<Mutex<DaemonState>>,
+    host: &str,
+    port: u16,
+    auth_token: Option<String>,
+) {
     let addr = format!("{host}:{port}");
     let server = match Server::http(&addr) {
         Ok(s) => {
             info!("HTTP server listening on http://{addr}");
             info!("Set RUST_LOG=debug for verbose logs");
+            if auth_token.is_some() {
+                info!(
+                    "Bearer-token authentication enabled (remote peers require Authorization: Bearer <token>)"
+                );
+            } else {
+                info!("Authentication disabled (all peers trusted)");
+            }
             s
         }
         Err(e) => {
@@ -55,8 +68,11 @@ pub fn start_server(state: Arc<Mutex<DaemonState>>, host: &str, port: u16) {
         let state = state.clone();
         let url = request.url().to_string();
         let method = request.method().clone();
-        debug!("{} {}", method, url);
-        if let Err(e) = handle(request, state, &method, &url) {
+        // Clone per request so handlers can borrow it; tiny_http consumes
+        // `request` in `respond`, so we can't share a long-lived binding
+        // across the loop without sending it back in.
+        let auth_token = auth_token.clone();
+        if let Err(e) = handle(request, state, &method, &url, &auth_token) {
             warn!("Failed to respond: {e}");
         }
     }
@@ -73,14 +89,31 @@ fn handle(
     state: Arc<Mutex<DaemonState>>,
     method: &Method,
     url: &str,
+    auth_token: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = url.split('?').next().unwrap_or(url);
     let route = route_for(method, path);
+
+    // ----------------------------------------------------------------
+    // Token / pairing endpoints bypass the bearer check but enforce a
+    // hard localhost requirement: they only respond to loopback peers.
+    // A non-local request to /auth/token or /auth/pair is a misuse, and
+    // returning a clear 403 (rather than 401, which would imply "you
+    // could supply the right credential") avoids confusing attackers
+    // who probe them from off-host.
+    // ----------------------------------------------------------------
+    match route {
+        Route::AuthTokenGet => return handle_auth_token(request, auth_token),
+        Route::AuthPair => return handle_auth_pair(request, auth_token),
+        _ => {}
+    }
 
     if matches!(route, Route::Help) {
         let resp = json_response(200, &serde_json::json!({
             "endpoints": [
                 "GET  /help",
+                "GET  /auth/token (localhost-only; returns the bearer token when auth is enabled)",
+                "POST /auth/pair (localhost-only; pairing-style token endpoint, currently returns the same token as /auth/token)",
                 "GET  /songs?q=",
                 "GET  /search?q=... (best match) or POST /search {query}",
                 "GET  /search/all?q=... (every match above threshold)",
@@ -122,6 +155,45 @@ fn handle(
         return Ok(request.respond(resp)?);
     }
 
+    // ----------------------------------------------------------------
+    // Auth gate for every other route. We deliberately do NOT log the
+    // Authorization header's value (or even its presence with explicit
+    // token bytes) — the attacker-supplied bytes are the secret. Only
+    // the route + method is logged so an operator can correlate
+    // rejections with client intent.
+    // ----------------------------------------------------------------
+    if !auth::request_is_authorized(&request, auth_token.as_deref()) {
+        debug!(
+            "auth: rejecting {method} {path} from {} (no/invalid token)",
+            request
+                .remote_addr()
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string())
+        );
+        let mut resp = json_response(
+            401,
+            &ApiError {
+                error: "unauthorized".to_string(),
+            },
+        );
+        // Advertise the auth scheme to well-behaved clients (the CLI's
+        // auto-fetch fallback, future GUI implementations, third-party
+        // tools). The `realm` is purely informational; the daemon
+        // doesn't currently namespace per-user, so a single realm label
+        // is sufficient. We only attach the header when authentication
+        // IS actually enabled, so a 401 from a daemon with auth off
+        // doesn't advertise a mechanism that wouldn't accept a token.
+        if auth_token.is_some() {
+            if let Ok(h) = Header::from_bytes(
+                &b"WWW-Authenticate"[..],
+                &b"Bearer realm=\"sjnmusicd\""[..],
+            ) {
+                resp.add_header(h);
+            }
+        }
+        return Ok(request.respond(resp)?);
+    }
+
     let mut body_text = String::new();
     if matches!(method, Method::Post | Method::Delete | Method::Put | Method::Patch) {
         match read_body(&mut request) {
@@ -152,6 +224,13 @@ fn handle(
 
     let response = match route {
         Route::Help => unreachable!(),
+        // /auth/token and /auth/pair are intercepted at the top of
+        // `handle()` (before the auth gate) and short-circuited with an
+        // explicit `return`. After that gate they cannot reach this
+        // dispatch block, so the arms below are defensive.
+        Route::AuthTokenGet | Route::AuthPair => unreachable!(
+            "/auth/token and /auth/pair are intercepted before this match"
+        ),
 
         Route::Songs => {
             let q = query_params.get("q").map(|s| s.as_str());
@@ -490,6 +569,73 @@ fn json_response_now_playing(state: &DaemonState) -> Response<std::io::Cursor<Ve
     )
 }
 
+fn handle_auth_token(
+    request: Request,
+    auth_token: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !auth::is_local_request(&request) {
+        let resp = json_response(
+            403,
+            &ApiError {
+                error: "/auth/token is reachable only from loopback".to_string(),
+            },
+        );
+        return Ok(request.respond(resp)?);
+    }
+    match auth_token.as_deref() {
+        Some(t) => {
+            let resp = json_response(200, &serde_json::json!({ "token": t }));
+            Ok(request.respond(resp)?)
+        }
+        None => {
+            // No token configured → authentication is off. We expose
+            // this explicitly so the CLI knows not to bother retrying.
+            let resp = json_response(
+                404,
+                &ApiError {
+                    error: "authentication disabled (no token configured)".to_string(),
+                },
+            );
+            Ok(request.respond(resp)?)
+        }
+    }
+}
+
+fn handle_auth_pair(
+    request: Request,
+    auth_token: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !auth::is_local_request(&request) {
+        let resp = json_response(
+            403,
+            &ApiError {
+                error: "/auth/pair is reachable only from loopback".to_string(),
+            },
+        );
+        return Ok(request.respond(resp)?);
+    }
+    // The full pairing endpoint can in future rotate / generate /
+    // revoke. Today it mirrors /auth/token: token is generated at
+    // daemon startup and persists in `~/.sjn/music/config.toml`, so
+    // there is nothing to do here. The endpoint still exists so future
+    // servers can extend it without a CLI breaking change.
+    match auth_token.as_deref() {
+        Some(t) => {
+            let resp = json_response(200, &serde_json::json!({ "token": t }));
+            Ok(request.respond(resp)?)
+        }
+        None => {
+            let resp = json_response(
+                404,
+                &ApiError {
+                    error: "authentication disabled (no token configured)".to_string(),
+                },
+            );
+            Ok(request.respond(resp)?)
+        }
+    }
+}
+
 #[derive(Debug)]
 enum AudioRoute {
     Pause,
@@ -524,6 +670,8 @@ fn handle_audio_route(
 #[derive(Debug)]
 enum Route {
     Help,
+    AuthTokenGet,
+    AuthPair,
     Songs,
     Search,
     SearchAll,
@@ -565,6 +713,8 @@ fn route_for(method: &Method, path: &str) -> Route {
     let p = path.trim_end_matches('/');
     match (method, p) {
         (Method::Get, "") | (Method::Get, "/help") => Route::Help,
+        (Method::Get, "/auth/token") => Route::AuthTokenGet,
+        (Method::Post, "/auth/pair") => Route::AuthPair,
         (Method::Get, "/songs") => Route::Songs,
         (m, "/search") if matches!(m, Method::Get | Method::Post) => Route::Search,
         (Method::Get, "/search/all") => Route::SearchAll,

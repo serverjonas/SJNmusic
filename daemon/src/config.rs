@@ -116,9 +116,36 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub download: DownloadConfig,
+    /// When `true`, the daemon requires `Authorization: Bearer <token>`
+    /// for any request whose peer is NOT a loopback address. The matching
+    /// `auth_token` is auto-generated at startup if it is still empty
+    /// (see `daemon::run`), then persisted to disk via
+    /// [`Config::save`] so subsequent restarts reuse the same token.
+    #[serde(default)]
+    pub auth_enabled: bool,
+    /// Bearer credential compared against incoming `Authorization` headers
+    /// when `auth_enabled = true`. Empty string disables auth entirely
+    /// regardless of the `auth_enabled` flag — the daemon treats any
+    /// `auth_token == ""` as "no token configured, allow all remote".
+    #[serde(default)]
+    pub auth_token: String,
 }
 
 impl Config {
+    /// Persist the current `Config` back to its TOML file. Used by the
+    /// daemon only after a new bearer token has been auto-generated at
+    /// startup, so the same token is reusable across restarts. Falls
+    /// back silently on serialization/write failures — the daemon will
+    /// still boot with the in-memory token, it just won't survive a
+    /// restart (and will log a warning about that).
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = config_path();
+        let serialized = toml::to_string_pretty(self).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?;
+        fs::write(&path, serialized)
+    }
+
     /// Load configuration from the TOML file. If the file does not exist, create
     /// it with sensible defaults so the daemon can be configured on first run.
     pub fn load() -> Self {
