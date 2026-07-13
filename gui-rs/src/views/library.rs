@@ -17,6 +17,23 @@ pub fn show(ui: &mut egui::Ui, app: &mut SJNMusicApp) {
     ui.horizontal(|ui| {
         ui.heading("Library");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // ▶ Play all (shuffle): replace the queue with the whole
+            // library in random order. Disabled while the daemon is
+            // unreachable so the user doesn't get a silent no-op click,
+            // disabled while the first library fetch is still in flight
+            // (so the user sees a "loading…" message instead of a
+            // silently dead button), and disabled until the fetch has
+            // returned a non-empty result (so a real empty library
+            // doesn't pretend to have something to shuffle).
+            let can_play_all = app.state.is_online()
+                && !app.library_loading
+                && !app.library_songs.is_empty();
+            if ui
+                .add_enabled(can_play_all, egui::Button::new("▶ Play all (shuffle)"))
+                .clicked()
+            {
+                play_all_now(app);
+            }
             let response = ui.add(
                 egui::TextEdit::singleline(&mut app.library_query)
                     .hint_text("Filter by name (fuzzy)")
@@ -112,6 +129,25 @@ fn row(ui: &mut egui::Ui, song: &Song, app: &mut SJNMusicApp) {
                 });
             });
         });
+}
+
+/// Send `POST /play/all` to the daemon and surface the result as a
+/// toast. The call is synchronous but cheap (loopback + ~10 ms server
+/// time), matching how `play_playlist`, `create_playlist`, etc. are
+/// handled elsewhere — fire-and-forget would lose the queued-count
+/// success message and the daemon's "library is empty" rejection.
+fn play_all_now(app: &mut SJNMusicApp) {
+    let daemon: Arc<DaemonClient> = app.daemon.clone();
+    match daemon.play_all() {
+        Ok(resp) => app.push_toast(
+            format!("Shuffled {} song(s) into the queue", resp.queued),
+            crate::state::ToastLevel::Success,
+        ),
+        Err(e) => app.push_toast(
+            format!("Play-all failed: {e}"),
+            crate::state::ToastLevel::Error,
+        ),
+    }
 }
 
 /// First-paint fetch. We set `library_loading` BEFORE the call so a

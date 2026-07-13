@@ -450,6 +450,40 @@ impl DaemonState {
         Ok(song)
     }
 
+    /// Replace the queue with a shuffled copy of the entire library.
+    ///
+    /// Mirrors `/playlists/{name}/play`: clear the queue, re-insert in
+    /// random order, persist to the DB, and refresh `cycle_snapshot` so
+    /// `RepeatMode::All` keeps looping over the same shuffle. The daemon
+    /// tick loop picks up the new head of queue and starts playback
+    /// automatically once the audio engine is idle (same model as
+    /// `/play`); calling `play_all_random` while a song is playing only
+    /// queues the rest of the library behind the current track.
+    ///
+    /// Returns the number of songs queued. An empty library surfaces
+    /// `"library is empty"` to the HTTP layer so the GUI/CLI can render
+    /// a useful toast instead of silently doing nothing.
+    pub fn play_all_random(&mut self) -> Result<usize, String> {
+        let mut shuffled = self.all_songs();
+        if shuffled.is_empty() {
+            return Err("library is empty".to_string());
+        }
+        use rand::seq::SliceRandom;
+        shuffled.shuffle(&mut rand::thread_rng());
+        {
+            let conn = self.lock_conn();
+            Self::queue_clear_db(&conn).map_err(|e| e.to_string())?;
+            for s in &shuffled {
+                Self::queue_append_db(&conn, s.id).map_err(|e| e.to_string())?;
+            }
+        }
+        let len = shuffled.len();
+        self.queue = shuffled;
+        self.cycle_snapshot = self.queue.clone();
+        info!("Play-all: queued {len} songs in random order");
+        Ok(len)
+    }
+
     /// In-place shuffle of the current queue.
     pub fn shuffle_queue(&mut self) -> Result<(), String> {
         if self.queue.len() < 2 {

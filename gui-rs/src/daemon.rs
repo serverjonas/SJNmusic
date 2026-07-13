@@ -283,6 +283,11 @@ pub struct ClearedResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlayAllResponse {
+    pub queued: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OkResponse {
     pub ok: bool,
 }
@@ -537,6 +542,12 @@ impl DaemonClient {
 
     pub fn clear(&self) -> Result<ClearedResponse, DaemonError> {
         self.post_json("/queue/clear", &serde_json::json!({}))
+    }
+
+    /// Replace the queue with the entire library in random order.
+    /// Server returns the number of songs queued (`{"queued": N}`).
+    pub fn play_all(&self) -> Result<PlayAllResponse, DaemonError> {
+        self.post_json("/play/all", &serde_json::json!({}))
     }
 
     pub fn init(&self, name: &str, url: Option<&str>) -> Result<InitResponse, DaemonError> {

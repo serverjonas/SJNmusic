@@ -84,6 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("resume", help="resume playback")
     sub.add_parser("shuffle", help="shuffle the queue in place")
     sub.add_parser("clear", help="empty the queue")
+    sub.add_parser(
+        "play-all",
+        help="shuffle the entire library into the queue and start playing",
+    )
     sub.add_parser("songs", help="list all known songs")
     sub.add_parser("playlists", help="list all playlists")
     sub.add_parser("downloads", help="list recent yt-dlp download jobs")
@@ -537,6 +541,9 @@ def print_response(args, status, payload):
         else:
             print("now playing: (idle)")
         return
+    if isinstance(obj, dict) and "queued" in obj:
+        print(f"queued {obj['queued']} song(s) in random order")
+        return
     if isinstance(obj, dict) and "songs" in obj:
         for s in obj["songs"]:
             print(f"[{s['id']}] {s['name']}")
@@ -642,6 +649,8 @@ def main(argv=None):
         status, payload = request(args, host, port, "POST", "/queue/shuffle")
     elif args.cmd == "clear":
         status, payload = request(args, host, port, "POST", "/queue/clear")
+    elif args.cmd == "play-all":
+        status, payload = request(args, host, port, "POST", "/play/all", body={})
     elif args.cmd == "songs":
         status, payload = request(args, host, port, "GET", "/songs")
     elif args.cmd == "downloads":

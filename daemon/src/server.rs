@@ -132,6 +132,7 @@ fn handle(
                 "POST /del {query}",
                 "POST /init {song} (async, returns job id, status 202)",
                 "POST /init/batch {songs:[...]}",
+                "POST /play/all",
                 "POST /skip",
                 "POST /pause",
                 "POST /resume",
@@ -412,6 +413,14 @@ fn handle(
             Err(e) => error_response(e),
         },
 
+        Route::PlayAll => match state.play_all_random() {
+            Ok(len) => json_response(
+                200,
+                &serde_json::json!({ "queued": len }),
+            ),
+            Err(e) => error_response(e),
+        },
+
         Route::Skip => {
             state.audio_handle.send(AudioCmd::Stop);
             // Always clear current — a skip is an explicit decision to
@@ -688,6 +697,7 @@ enum Route {
     Del,
     InitAsync,
     InitBatch,
+    PlayAll,
     Skip,
     QueueShuffle,
     QueueClear,
@@ -731,6 +741,7 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Post, "/del") => Route::Del,
         (Method::Post, "/init") => Route::InitAsync,
         (Method::Post, "/init/batch") => Route::InitBatch,
+        (Method::Post, "/play/all") => Route::PlayAll,
         (Method::Post, "/skip") => Route::Skip,
         (Method::Post, "/queue/shuffle") => Route::QueueShuffle,
         (Method::Post, "/queue/clear") => Route::QueueClear,
