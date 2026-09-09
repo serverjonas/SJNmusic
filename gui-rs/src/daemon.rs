@@ -45,6 +45,10 @@ pub struct YtCandidate {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// yt-dlp's reported view count (`0.0` when unavailable). Surfaced so
+    /// the picker can show popularity context for same-song uploads.
+    #[serde(default)]
+    pub view_count: f64,
 }
 
 /// Per-signal score that `GET /search/yt/ranked` attaches to every
@@ -80,6 +84,19 @@ pub struct ScoreBreakdown {
     pub instrumental: i32,
     #[serde(default)]
     pub karaoke: i32,
+    // Newer-daemon fields; ignored by older daemons via `#[serde(default)]`.
+    #[serde(default)]
+    pub title_similarity: i32,
+    #[serde(default)]
+    pub artist_similarity: i32,
+    #[serde(default)]
+    pub view_count: i32,
+    #[serde(default)]
+    pub cover: i32,
+    #[serde(default)]
+    pub type_beat: i32,
+    #[serde(default)]
+    pub compilation: i32,
 }
 
 /// `GET /search/yt/ranked` candidate: a `YtCandidate` + score +
@@ -102,6 +119,15 @@ pub struct RankedCandidate {
     pub flags: Vec<String>,
 }
 
+/// Why the daemon's `/pick` auto-selected a candidate (margin vs
+/// required margin, equivalence info). Sent alongside `PickResponse::Auto`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AutoPickMeta {
+    pub margin: i32,
+    pub required_margin: i32,
+    pub equivalent_count: usize,
+}
+
 /// `GET /pick` response. Tagged enum so the GUI can branch on the
 /// `kind` discriminator:
 /// - `auto` → proceeds straight to `/init` with `url`,
@@ -118,6 +144,9 @@ pub enum PickResponse {
         duration_secs: f64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         flags: Vec<String>,
+        /// Newer-daemon field; `None` for older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<AutoPickMeta>,
     },
     NeedsChoice {
         candidates: Vec<RankedCandidate>,

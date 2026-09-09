@@ -42,6 +42,11 @@ pub struct YtCandidate {
     /// is a list of sizes). `None` when yt-dlp didn't include any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// yt-dlp's reported view count. `0.0` when unavailable. Used only by
+    /// the ranking heuristics as a same-song popularity tie-breaker —
+    /// never to compare popularity across different songs.
+    #[serde(default)]
+    pub view_count: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -629,6 +634,7 @@ impl DaemonState {
                         .to_string();
                     let uploader = pick_uploader(&v);
                     let duration_secs = v.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let view_count = v.get("view_count").and_then(|x| x.as_f64()).unwrap_or(0.0);
                     let url = v
                         .get("webpage_url")
                         .and_then(|x| x.as_str())
@@ -646,6 +652,7 @@ impl DaemonState {
                         duration_secs,
                         url,
                         thumbnail,
+                        view_count,
                     });
                 }
                 Err(e) => {
@@ -663,6 +670,52 @@ impl DaemonState {
             }
         }
         Ok(results)
+    }
+
+    /// Fetch view counts for a batch of YouTube video ids in ONE yt-dlp
+    /// call (`-j "https://youtu.be/<id>"` per id, merged into a single
+    /// invocation). Returns a map id → view count; ids yt-dlp couldn't
+    /// resolve are simply absent. Used by the ranking post-pass to enrich
+    /// the top candidates when the auto-pick is uncertain. Errors surface
+    /// as `Err` so the caller can skip enrichment gracefully.
+    pub fn search_yt_view_counts(ids: &[String]) -> Result<std::collections::HashMap<String, f64>, String> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let targets: Vec<String> = ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("https://youtu.be/{}", id.trim()))
+            .collect();
+        if targets.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let output = std::process::Command::new("yt-dlp")
+            .args(["--no-warnings", "--flat-playlist", "-j"])
+            .args(&targets)
+            .output();
+        let out = match output {
+            Ok(o) => o,
+            Err(e) => return Err(format!("yt-dlp unavailable: {e}")),
+        };
+        let mut counts = std::collections::HashMap::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => {
+                    let Some(id) = v.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()) else {
+                        continue;
+                    };
+                    let vc = v.get("view_count").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    counts.insert(id, vc);
+                }
+                Err(e) => warn!("yt-dlp view-count fetch: skipping malformed JSON line: {e}"),
+            }
+        }
+        Ok(counts)
     }
 
     /// Clear the queue (memory + DB).
@@ -1271,7 +1324,17 @@ fn run_download_job(
     // for a brief DB insert at the end. Do NOT call it as
     // `state.lock().unwrap().init_sync(...)` — that would re-introduce
     // the freeze-while-downloading bug for both the CLI and the GUI.
-    let result = DaemonState::init_sync(&state, &name, &source);
+    // Resolve legacy `ytsearch1:` sources through the scoring pipeline so
+    // plain /init + init_batch downloads pick the RIGHT upload instead of
+    // yt-dlp's raw search order. Explicit URLs and non-1 ytsearch counts
+    // pass through verbatim (see `resolve_search_source`). Resolution runs
+    // OUTSIDE the state mutex — it can spawn several yt-dlp subprocesses.
+    let resolved_source = crate::youtube::resolve_search_source(&source)
+        .unwrap_or_else(|| source.clone());
+    if resolved_source != source {
+        info!("Auto-pick resolved {source:?} → {resolved_source:?}");
+    }
+    let result = DaemonState::init_sync(&state, &name, &resolved_source);
     {
         let guard = state.lock().unwrap();
         let mut jobs = guard.download_jobs.lock().unwrap();

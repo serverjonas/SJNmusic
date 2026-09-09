@@ -270,10 +270,20 @@ fn start_smart_pick(app: &mut SJNMusicApp) {
                 url,
                 title,
                 score,
+                decision,
                 ..
             }) => {
                 // Download straight away.
-                log::info!("smart-pick auto-selected: {title:?} score={score}");
+                match decision {
+                    Some(d) => log::info!(
+                        "smart-pick auto-selected: {title:?} score={score} \
+                         (margin {} ≥ required {}, equivalents: {})",
+                        d.margin,
+                        d.required_margin,
+                        d.equivalent_count
+                    ),
+                    None => log::info!("smart-pick auto-selected: {title:?} score={score}"),
+                }
                 if let Err(e) = daemon.init(&job_name, Some(&url)) {
                     log::warn!("smart-pick /init failed: {e}");
                 }
