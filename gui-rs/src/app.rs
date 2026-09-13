@@ -515,7 +515,7 @@ impl SJNMusicApp {
                     egui::Frame::group(ui.style())
                         .fill(bg)
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             ui.visuals().widgets.noninteractive.bg_stroke.color,
                         ))
                         .show(ui, |ui| {
