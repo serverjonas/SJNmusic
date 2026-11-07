@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use log::{debug, error, info, warn};
 
@@ -144,70 +145,84 @@ pub fn run(mut cfg: Config) {
 
 /// One iteration of the playback loop. Pulled out so it can be unit-tested
 /// without a sleep or a network server.
+///
+/// Queue model: `state.current` is detached from `queue` (the song leaves
+/// the queue when playback starts), so the tick never removes a queue row
+/// at end-of-track. History and repeat rules apply to the song that
+/// actually played, and anything queued while a song plays stays put —
+/// this is what makes the queue predictable.
+///
+/// Grace window: the audio engine runs on its own thread; between the tick
+/// sending `Play` and the engine flipping `playing = true` there is a short
+/// window in which `!playing` says nothing about the track's fate. The tick
+/// only concludes "this track ended" once more than `PLAY_GRACE` has passed
+/// since the song was promoted (or the engine reports a play failure
+/// directly). Reading a single unguarded snapshot here is what previously
+/// made the queue jump around unpredictably.
 fn tick(state: &Arc<Mutex<DaemonState>>) {
+    const PLAY_GRACE: Duration = Duration::from_millis(1500);
     let mut state = state.lock().unwrap();
 
     // Single snapshot per tick — cheaper (one lock acquisition) and avoids
     // races where the audio thread flips `playing` between two reads.
     let snap = state.audio_handle.snapshot();
 
-    // 1) End-of-track / failed-play handling. We only decide what happened
-    // AFTER the audio thread has finished deciding things itself, i.e.
-    // `audio_pending_play == false`. The two outcomes we differentiate now:
-    //   - `snap.last_play_failed == true` ⇒ the `Play` command errored. We
-    //     drop `state.current` and pop the queue row, but we DON'T write a
-    //     history row (the song was never actually heard).
-    //   - `snap.last_play_failed == false` & `!snap.playing` & some time
-    //     elapsed ⇒ natural end-of-track. Record history with the elapsed
-    //     time and apply repeat-mode rules.
-    if state.current.is_some() && !snap.audio_pending_play {
-        if snap.last_play_failed {
-            let prev = state.current.take();
-            state.popped_for_current = false;
-            let _ = state.pop_played(None); // drop queue row, no history
-            if let Some(p) = prev {
-                debug!("audio: {} never actually played (setup failed)", p.name);
+    // Remember the last observed playback position so end-of-track can
+    // write an accurate history row even though the engine clears its
+    // own clock the moment the track ends.
+    if snap.playing {
+        state.last_elapsed_secs = snap.elapsed_secs();
+    }
+
+    let promoted_enough = state
+        .promoted_at
+        .map(|t| t.elapsed() >= PLAY_GRACE)
+        .unwrap_or(true);
+
+    // End-of-track / failed-play handling. Only decided once the engine
+    // has settled (`audio_pending_play == false`) AND the grace window has
+    // elapsed since the song was promoted.
+    if state.current.is_some()
+        && !snap.playing
+        && !snap.audio_pending_play
+        && promoted_enough
+    {
+        let prev = state.current.take();
+        if let Some(p) = prev {
+            if snap.last_play_failed {
+                warn!("audio: {} failed to play (setup error) — moving on", p.name);
+                // No history (never heard) and no repeat rules: re-queueing
+                // a broken file under repeat-one/all would retry it in a
+                // hot loop forever.
+            } else {
+                let played_secs = state.last_elapsed_secs;
+                debug!("Playback finished for {} (~{played_secs:.1}s)", p.name);
+                state.record_history(p.id, played_secs);
                 apply_repeat_after_end(&mut state, &p);
-            }
-        } else if !snap.playing {
-            if let Some(prev) = state.current.take() {
-                let played_secs = snap.elapsed_secs();
-                debug!(
-                    "Playback finished for {} (~{played_secs:.1}s)",
-                    prev.name
-                );
-                let _ = state.pop_played(Some(played_secs));
-                apply_repeat_after_end(&mut state, &prev);
-                state.popped_for_current = false;
             }
         }
     }
 
-    // 2) Pop the queue row for the song we just kicked off, but only once
-    //    the audio thread confirmed it actually got the sink running. Until
-    //    then, we risk a double-pop if the play failed.
-    if state.current.is_some() && snap.playing && !state.popped_for_current {
-        let _ = state.pop_played(None); // drop queue row only, no history
-        state.popped_for_current = true;
-    }
-
-    // 3) Start the next song if the queue has one and the audio engine is
-    //    idle (idle = not playing AND not mid-setup).
+    // Start the next song if the queue has one and the audio engine is
+    // idle (idle = not playing AND not mid-setup).
     if !state.queue.is_empty()
         && !snap.playing
         && !snap.audio_pending_play
         && state.current.is_none()
     {
-        let next = state.queue[0].clone();
-        debug!("Starting playback: {} ({})", next.name, next.path);
-        state.current = Some(next.clone());
-        state.popped_for_current = false;
-        state.audio_handle.send(crate::audio::AudioCmd::Play(next.path.clone()));
+        state.promote_next();
     }
 }
 
-/// Apply repeat-mode rules after a track has ended and `pop_played` has
-/// already removed it from the queue.
+/// Apply repeat-mode rules after a track has ended. The song already left
+/// the queue when it started playing; repeat-one appends it at the tail and
+/// repeat-all refills from the cycle snapshot once the queue has drained.
+///
+/// Note: the cycle snapshot is intentionally NOT refreshed here. It only
+/// changes when the user mutates the queue (play, add, shuffle, playlist
+/// load, …). Refreshing it on every natural end used to shrink the snapshot
+/// down to the last remaining song, so "repeat all" eventually looped just
+/// one track instead of the whole queue.
 fn apply_repeat_after_end(state: &mut DaemonState, prev: &Song) {
     match state.repeat_mode {
         RepeatMode::Off => {
@@ -231,8 +246,6 @@ fn apply_repeat_after_end(state: &mut DaemonState, prev: &Song) {
                     warn!("failed to refill queue for repeat-all: {e}");
                 }
                 state.queue = snapshot;
-            } else {
-                state.cycle_snapshot = state.queue.clone();
             }
         }
     }

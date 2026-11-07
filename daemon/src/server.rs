@@ -134,13 +134,11 @@ fn handle(
                 "POST /init/batch {songs:[...]}",
                 "POST /play/all",
                 "POST /skip",
-                "POST /pause",
-                "POST /resume",
-                "POST /seek {secs}",
-                "POST /volume {vol}",
-                "POST /repeat {mode}",
                 "POST /queue/shuffle",
                 "POST /queue/clear",
+                "POST /queue/remove {pos} (1-based position in /queue output)",
+                "POST /queue/jump {pos} (start this entry now, drop the ones before it)",
+                "POST /queue/reorder {from, to} (1-based)",
                 "GET  /playlists",
                 "POST /playlists {name}",
                 "GET  /playlists/{name}",
@@ -421,19 +419,48 @@ fn handle(
             Err(e) => error_response(e),
         },
 
-        Route::Skip => {
-            state.audio_handle.send(AudioCmd::Stop);
-            // Always clear current — a skip is an explicit decision to
-            // abandon the playing song, so we don't want the daemon tick to
-            // later treat it as a natural end-of-track and write a bogus
-            // `history` row.
-            state.current = None;
-            match state.skip() {
-                Ok(Some(s)) => json_response(200, &s),
-                Ok(None) => json_response(200, &serde_json::json!({"skipped": null})),
-                Err(e) => error_response(e),
-            }
+        Route::Skip => match state.skip() {
+            // `skip()` owns the whole transition: stops the audio engine,
+            // clears `current`, writes no history. The response names the
+            // song that WAS playing — not the next one (the old handler
+            // popped queue[0] and reported that, which was simply wrong).
+            Ok(Some(s)) => json_response(200, &serde_json::json!({ "skipped": s })),
+            Ok(None) => json_response(200, &serde_json::json!({"skipped": null})),
+            Err(e) => error_response(e),
         }
+
+        Route::QueueRemove => match pos_from_body(&body_text) {
+            Ok(pos) => match state.remove_from_queue(pos) {
+                Ok(song) => json_response(
+                    200,
+                    &serde_json::json!({ "removed": song, "len": state.queue.len() }),
+                ),
+                Err(e) => error_response(e),
+            },
+            Err(e) => error_response(e),
+        },
+
+        Route::QueueJump => match pos_from_body(&body_text) {
+            Ok(pos) => match state.jump_to(pos) {
+                Ok(song) => json_response(
+                    200,
+                    &serde_json::json!({ "playing": song, "len": state.queue.len() }),
+                ),
+                Err(e) => error_response(e),
+            },
+            Err(e) => error_response(e),
+        },
+
+        Route::QueueReorder => match reorder_from_body(&body_text) {
+            Ok((from, to)) => match state.reorder_queue(from, to) {
+                Ok(()) => json_response(
+                    200,
+                    &serde_json::json!({"reordered": true, "len": state.queue.len()}),
+                ),
+                Err(e) => error_response(e),
+            },
+            Err(e) => error_response(e),
+        },
 
         Route::QueueShuffle => match state.shuffle_queue() {
             Ok(()) => json_response(200, &serde_json::json!({"shuffled": true, "len": state.queue.len()})),
@@ -701,6 +728,9 @@ enum Route {
     Skip,
     QueueShuffle,
     QueueClear,
+    QueueRemove,
+    QueueJump,
+    QueueReorder,
     Audio(AudioRoute),
     RepeatGet,
     RepeatSet,
@@ -736,7 +766,6 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Get, "/downloads") => Route::Downloads,
         (Method::Get, "/history") => Route::History,
         (Method::Get, "/stats") => Route::Stats,
-        (Method::Post, "/play") => Route::Play,
         (Method::Post, "/add") => Route::Add,
         (Method::Post, "/del") => Route::Del,
         (Method::Post, "/init") => Route::InitAsync,
@@ -745,6 +774,10 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Post, "/skip") => Route::Skip,
         (Method::Post, "/queue/shuffle") => Route::QueueShuffle,
         (Method::Post, "/queue/clear") => Route::QueueClear,
+        (Method::Post, "/queue/remove") => Route::QueueRemove,
+        (Method::Post, "/queue/jump") => Route::QueueJump,
+        (Method::Post, "/queue/reorder") => Route::QueueReorder,
+        (Method::Post, "/play") => Route::Play,
         (Method::Post, "/pause") => Route::Audio(AudioRoute::Pause),
         (Method::Post, "/resume") => Route::Audio(AudioRoute::Resume),
         (Method::Post, "/seek") => Route::Audio(AudioRoute::Seek),
@@ -966,6 +999,26 @@ fn mode_from_body_or_default(body: &str) -> Result<RepeatMode, String> {
         }
     }
     Err("missing 'mode' in body".to_string())
+}
+
+/// Parse a 1-based queue position from the body. Accepts `pos` or the
+/// longer spellings so the CLI/GUI don't need to agree on one key.
+fn pos_from_body(body: &str) -> Result<usize, String> {
+    let v = parse_body(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "expected JSON object".to_string())?;
+    for key in ["pos", "position", "index"] {
+        if let Some(n) = obj.get(key) {
+            if let Some(i) = n.as_i64() {
+                if i >= 1 {
+                    return Ok(i as usize);
+                }
+                return Err("positions are 1-based".to_string());
+            }
+        }
+    }
+    Err("missing 'pos' (1-based queue position) in body".to_string())
 }
 
 fn reorder_from_body(body: &str) -> Result<(usize, usize), String> {

@@ -79,11 +79,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("queue", help="show the current queue")
     sub.add_parser("now", help="alias for /now-playing")
     sub.add_parser("status", help="one-line summary of current playback")
-    sub.add_parser("skip", help="skip the next song")
+    sub.add_parser("skip", help="skip the song that is playing now")
     sub.add_parser("pause", help="pause playback")
     sub.add_parser("resume", help="resume playback")
     sub.add_parser("shuffle", help="shuffle the queue in place")
-    sub.add_parser("clear", help="empty the queue")
+    sub.add_parser("clear", help="empty the queue (keeps the current song playing)")
+
+    q_pos = sub.add_parser(
+        "q-rm", help="remove one entry from the queue by position (see 'queue')"
+    )
+    q_pos.add_argument("pos", type=int, help="1-based position in the queue")
+    q_jump = sub.add_parser(
+        "q-jump",
+        help="start playing the entry at position now; earlier entries are dropped",
+    )
+    q_jump.add_argument("pos", type=int, help="1-based position in the queue")
+    q_move = sub.add_parser("q-reorder", help="move a queue entry to a new position")
+    q_move.add_argument("from_pos", type=int)
+    q_move.add_argument("to_pos", type=int)
     sub.add_parser(
         "play-all",
         help="shuffle the entire library into the queue and start playing",
@@ -533,13 +546,29 @@ def print_response(args, status, payload):
     if isinstance(obj, dict) and "queue" in obj and "current" in obj:
         repeat = obj.get("repeat", "off")
         print(f"queue (repeat={repeat}):")
-        for s in obj.get("queue", []):
-            print(f"  - [{s['id']}] {s['name']}")
+        for i, s in enumerate(obj.get("queue", []), 1):
+            # Positions are 1-based and match q-rm / q-jump / q-reorder.
+            print(f"  {i}. [{s['id']}] {s['name']}")
         cur = obj.get("current")
         if cur:
             print(f"now playing: [{cur['id']}] {cur['name']}")
         else:
             print("now playing: (idle)")
+        return
+    if isinstance(obj, dict) and "removed" in obj:
+        r = obj["removed"]
+        print(f"removed [{r['id']}] {r['name']} (queue now {obj.get('len', '?')} song(s))")
+        return
+    if isinstance(obj, dict) and "playing" in obj and "len" in obj and "queue" not in obj:
+        p = obj["playing"]
+        print(f"now playing: [{p['id']}] {p['name']} ({obj.get('len', '?')} left in queue)")
+        return
+    if isinstance(obj, dict) and "skipped" in obj:
+        s = obj["skipped"]
+        if s is None:
+            print("nothing was playing")
+        else:
+            print(f"skipped: [{s['id']}] {s['name']}")
         return
     if isinstance(obj, dict) and "queued" in obj:
         print(f"queued {obj['queued']} song(s) in random order")
@@ -639,6 +668,19 @@ def main(argv=None):
         status, payload = request(args, host, port, "GET", "/now-playing")
     elif args.cmd == "skip":
         status, payload = request(args, host, port, "POST", "/skip")
+    elif args.cmd == "q-rm":
+        status, payload = request(
+            args, host, port, "POST", "/queue/remove", body={"pos": args.pos}
+        )
+    elif args.cmd == "q-jump":
+        status, payload = request(
+            args, host, port, "POST", "/queue/jump", body={"pos": args.pos}
+        )
+    elif args.cmd == "q-reorder":
+        status, payload = request(
+            args, host, port, "POST", "/queue/reorder",
+            body={"from": args.from_pos, "to": args.to_pos},
+        )
     elif args.cmd == "pause":
         status, payload = request(args, host, port, "POST", "/pause")
     elif args.cmd == "resume":

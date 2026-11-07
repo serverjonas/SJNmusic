@@ -61,21 +61,54 @@ pub fn show(ui: &mut egui::Ui, app: &mut SJNMusicApp) {
             ui.label(egui::RichText::new("queue empty").weak());
             return;
         }
-        for (idx, song) in body.queue.iter().enumerate() {                egui::Frame::group(ui.style())
-                    .fill(ui.visuals().faint_bg_color)
-                    .show(ui, |ui| {
+        let total = body.queue.len();
+        for (idx, song) in body.queue.iter().enumerate() {
+            let pos = idx + 1; // 1-based, matches /queue/remove & /queue/jump
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().faint_bg_color)
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{}.", idx + 1));
+                        ui.label(format!("{pos}."));
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(&song.name).strong());
                             ui.label(egui::RichText::new(format!("id {}", song.id)).small().weak());
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Remove only from the queue — the old button
+                            // posted /del, which deleted the song from the
+                            // library AND the disk. /queue/remove just
+                            // takes it out of the upcoming queue.
                             if ui.button("remove").clicked() {
-                                app.fire_action("/del", serde_json::json!({"query": song.name}));
+                                app.fire_action(
+                                    "/queue/remove",
+                                    serde_json::json!({"pos": pos}),
+                                );
+                                app.push_toast(
+                                    format!("Removed {} from queue", song.name),
+                                    crate::state::ToastLevel::Info,
+                                );
                             }
-                            if ui.button("▶ skip-to").clicked() {
-                                app.fire_action("/play", serde_json::json!({"query": song.name}));
+                            // Jump: start this entry now, keeping the rest
+                            // of the queue after it (the old button posted
+                            // /play, which rebuilt the whole queue).
+                            if ui.button("▶ play").clicked() {
+                                app.fire_action(
+                                    "/queue/jump",
+                                    serde_json::json!({"pos": pos}),
+                                );
+                            }
+                            // Manual reordering within the queue.
+                            if pos > 1 && ui.button("▲").clicked() {
+                                app.fire_action(
+                                    "/queue/reorder",
+                                    serde_json::json!({"from": pos, "to": pos - 1}),
+                                );
+                            }
+                            if pos < total && ui.button("▼").clicked() {
+                                app.fire_action(
+                                    "/queue/reorder",
+                                    serde_json::json!({"from": pos, "to": pos + 1}),
+                                );
                             }
                         });
                     });

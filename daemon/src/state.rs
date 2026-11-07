@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
 use rusqlite::{params, Connection};
@@ -112,8 +112,15 @@ pub struct DownloadJob {
 pub struct DaemonState {
     pub conn: Mutex<Connection>,
     /// Songs pending play, in order. The first element is the next to play.
+    /// Invariant: `current` is never a member of `queue` — a song is moved
+    /// out of the queue onto `current` (`promote_next`) exactly when the
+    /// daemon hands it to the audio engine, and it is only ever put back
+    /// (repeat-one) at its tail. All queue mutations go through the helpers
+    /// below so the in-memory list and the DB stay in sync.
     pub queue: Vec<Song>,
-    /// Currently playing song, if any.
+    /// Currently playing song, if any. Always `Some` between the moment the
+    /// tick promotes a queue entry and the moment that track ends, is
+    /// skipped, or fails to load.
     pub current: Option<Song>,
     /// `Send + Sync` handle to the audio thread (which owns rodio's
     /// `OutputStream`, a `!Send` platform type). We never touch rodio
@@ -125,11 +132,16 @@ pub struct DaemonState {
     /// this mode we restore this snapshot so playback loops without the user
     /// having to refill the queue manually.
     pub cycle_snapshot: Vec<Song>,
-    /// `true` once the queue row for `current` has been popped at start of
-    /// play. Reset to `false` whenever we move on (success, failure, skip,
-    /// or natural end). Prevents double-removal of the queue row while the
-    /// audio thread transitions from "pending" to "playing".
-    pub popped_for_current: bool,
+    /// `Instant` at which the tick last promoted a song from the queue to
+    /// `current` (i.e. sent it to the audio engine). The tick's grace window
+    /// is measured from this moment; it is `None` whenever nothing has been
+    /// promoted yet or playback was stopped/skipped.
+    pub promoted_at: Option<Instant>,
+    /// Last non-zero playback position observed by the tick while a song
+    /// was playing. The audio engine clears its clock the instant a track
+    /// ends, so the tick snapshots `elapsed_secs` every tick and uses the
+    /// remembered value for the end-of-track history row.
+    pub last_elapsed_secs: f64,
     /// In-flight and recently completed download jobs.
     pub download_jobs: Mutex<HashMap<i64, DownloadJob>>,
     pub next_job_id: AtomicI64,
@@ -161,7 +173,8 @@ impl DaemonState {
             audio_handle,
             repeat_mode,
             cycle_snapshot: Vec::new(),
-            popped_for_current: false,
+            promoted_at: None,
+            last_elapsed_secs: 0.0,
             download_jobs: Mutex::new(HashMap::new()),
             next_job_id: AtomicI64::new(1),
             fuzzy_threshold,
@@ -389,7 +402,10 @@ impl DaemonState {
         scored.into_iter().map(|(s, _)| s).collect()
     }
 
-    /// Insert a song at the front of the queue and start playing it.
+    /// Queue `query` at the head: it plays immediately when the engine is
+    /// idle, otherwise right after the song that is currently playing. The
+    /// previous queue order is kept behind it — nothing the user queued
+    /// gets thrown away by a `/play`.
     pub fn play(&mut self, query: &str) -> Result<Song, String> {
         let song = self
             .search(query)
@@ -423,6 +439,10 @@ impl DaemonState {
             .ok_or_else(|| format!("song not found: {query}"))?;
         self.queue.push(song.clone());
         Self::queue_append_db(&self.lock_conn(), song.id).map_err(|e| e.to_string())?;
+        // Keep the repeat-all cycle in sync with what the user queued.
+        if self.repeat_mode == RepeatMode::All {
+            self.cycle_snapshot.push(song.clone());
+        }
         info!("Added to queue: {} (id={})", song.name, song.id);
         Ok(song)
     }
@@ -718,25 +738,41 @@ impl DaemonState {
         Ok(counts)
     }
 
-    /// Clear the queue (memory + DB).
+    /// Clear the queue (memory + DB). The song that is currently playing is
+    /// left alone — it is detached from the queue, so after a clear it simply
+    /// finishes and the engine goes idle. This is the standard player
+    /// behaviour: "clear" means "drop what's coming up", not "stop playing".
+    /// The cycle snapshot is cleared too, so an active repeat-all cannot
+    /// resurrect the queue right after the user emptied it.
     pub fn clear_queue(&mut self) -> Result<(), String> {
         self.queue.clear();
+        self.cycle_snapshot.clear();
         Self::queue_clear_db(&self.lock_conn()).map_err(|e| e.to_string())?;
-        info!("Queue cleared");
+        info!("Queue cleared ({} kept playing)",
+              self.current.as_ref().map(|s| s.name.as_str()).unwrap_or("nothing"));
         Ok(())
     }
 
-    /// Pop the song at the head of the queue. Only writes history when
-    /// `duration_secs_played` is `Some(_)`. Pass `None` for purely
-    /// housekeeping pops (start-of-song, /skip, etc).
-    pub fn pop_played(
-        &mut self,
-        duration_secs_played: Option<f64>,
-    ) -> Result<Option<Song>, String> {
+    // ------------------------------------------------------------------
+    // Queue lifecycle (used by the playback tick and HTTP handlers)
+    // ------------------------------------------------------------------
+
+    /// Remove the head of the queue and return it. Used only when the head
+    /// is *becoming* the current song — it is not a playback event, so no
+    /// history is involved (use `record_history` for that).
+    fn pop_head(&mut self) -> Option<Song> {
         if self.queue.is_empty() {
-            return Ok(None);
+            return None;
         }
-        let id = self.queue[0].id;
+        let song = self.queue.remove(0);
+        if let Err(e) = self.delete_first_queue_row(song.id) {
+            warn!("failed to remove queue row for song {}: {e}", song.id);
+        }
+        Some(song)
+    }
+
+    /// Delete the oldest queue row for `song_id` from the DB.
+    fn delete_first_queue_row(&self, song_id: i64) -> rusqlite::Result<()> {
         let conn = self.lock_conn();
         conn.execute(
             "DELETE FROM queue
@@ -744,27 +780,151 @@ impl DaemonState {
                AND position = (
                    SELECT MIN(position) FROM queue WHERE song_id = ?1
                )",
-            params![id],
-        )
-        .map_err(|e| format!("failed to delete queue row from DB: {e}"))?;
-        if let Some(secs) = duration_secs_played {
-            let secs_i = (secs.max(0.0)) as i64;
-            if let Err(e) = Self::write_history(&conn, id, unix_secs(), secs_i) {
-                warn!("failed to write history for song {id}: {e}");
-            }
-        }
-        drop(conn);
-        Ok(Some(self.queue.remove(0)))
+            params![song_id],
+        )?;
+        Ok(())
     }
 
-    pub fn skip(&mut self) -> Result<Option<Song>, String> {
-        if let Some(skipped) = self.pop_played(None)? {
-            self.current = None;
-            info!("Skipped {}", skipped.name);
-            Ok(Some(skipped))
-        } else {
-            Ok(None)
+    /// Write a history row for `song_id`. Kept separate from queue popping
+    /// so the two can never drift apart (the old `pop_played` wrote history
+    /// for whatever happened to sit at queue[0], which could be a song that
+    /// was never played).
+    pub fn record_history(&self, song_id: i64, secs_played: f64) {
+        let secs_i = secs_played.max(0.0) as i64;
+        let conn = self.lock_conn();
+        if let Err(e) = Self::write_history(&conn, song_id, unix_secs(), secs_i) {
+            warn!("failed to write history for song {song_id}: {e}");
         }
+    }
+
+    /// Promote the head of the queue to `current` and start playing it.
+    /// Returns the promoted song. The tick calls this only when the audio
+    /// engine is idle.
+    pub fn promote_next(&mut self) -> Option<Song> {
+        let song = self.pop_head()?;
+        info!("Starting playback: {} ({})", song.name, song.path);
+        self.current = Some(song.clone());
+        self.promoted_at = Some(Instant::now());
+        self.last_elapsed_secs = 0.0;
+        self.audio_handle
+            .send(crate::audio::AudioCmd::Play(song.path.clone()));
+        Some(song)
+    }
+
+    /// Skip the song that is currently playing. Returns the skipped song.
+    /// No history row is written (a skip means the user did not want to
+    /// hear it), and repeat-mode rules do not re-queue it.
+    pub fn skip(&mut self) -> Result<Option<Song>, String> {
+        let Some(skipped) = self.current.take() else {
+            // Nothing is playing. If the queue still has a head (e.g. the
+            // audio engine never got a chance to start it), drop it anyway
+            // so "skip" always makes forward progress.
+            return Ok(self.pop_head());
+        };
+        self.audio_handle.send(crate::audio::AudioCmd::Stop);
+        self.promoted_at = None;
+        self.last_elapsed_secs = 0.0;
+        info!("Skipped {}", skipped.name);
+        Ok(Some(skipped))
+    }
+
+    /// Remove the entry at `pos` (1-based, as shown in `/queue` output)
+    /// from the queue without touching playback. Returns the removed song.
+    pub fn remove_from_queue(&mut self, pos: usize) -> Result<Song, String> {
+        if pos == 0 {
+            return Err("positions are 1-based".to_string());
+        }
+        if pos > self.queue.len() {
+            return Err(format!(
+                "position out of range (queue has {} song(s))",
+                self.queue.len()
+            ));
+        }
+        let song = self.queue.remove(pos - 1);
+        // Re-persist the whole queue: positions shift after a removal.
+        {
+            let conn = self.lock_conn();
+            Self::queue_clear_db(&conn).map_err(|e| e.to_string())?;
+            for s in &self.queue {
+                Self::queue_append_db(&conn, s.id).map_err(|e| e.to_string())?;
+            }
+        }
+        self.cycle_snapshot = self.queue.clone();
+        info!("Removed {} from queue (pos {pos})", song.name);
+        Ok(song)
+    }
+
+    /// Jump playback to the entry at `pos` (1-based): start it immediately
+    /// and drop every entry before it (they were passed over). Entries after
+    /// it keep their order. Returns the song now playing.
+    pub fn jump_to(&mut self, pos: usize) -> Result<Song, String> {
+        if pos == 0 {
+            return Err("positions are 1-based".to_string());
+        }
+        if pos > self.queue.len() {
+            return Err(format!(
+                "position out of range (queue has {} song(s))",
+                self.queue.len()
+            ));
+        }
+        let song = self.queue.remove(pos - 1);
+        if let Err(e) = self.delete_first_queue_row(song.id) {
+            warn!("failed to remove queue row for song {}: {e}", song.id);
+        }
+        // The song playing up to this moment gets its partial history row
+        // (same as a natural end) — it was genuinely heard.
+        if let Some(prev) = self.current.take() {
+            self.record_history(prev.id, self.last_elapsed_secs);
+        }
+        // Drop the passed-over songs from memory and DB.
+        let discarded: Vec<Song> = self.queue.drain(..pos - 1).collect();
+        if !discarded.is_empty() {
+            let conn = self.lock_conn();
+            Self::queue_clear_db(&conn).map_err(|e| e.to_string())?;
+            for s in &self.queue {
+                Self::queue_append_db(&conn, s.id).map_err(|e| e.to_string())?;
+            }
+        }
+        self.cycle_snapshot = self.queue.clone();
+        info!(
+            "Jumping to {} (pos {pos}; {} skipped over)",
+            song.name,
+            discarded.len()
+        );
+        self.current = Some(song.clone());
+        self.promoted_at = Some(Instant::now());
+        self.last_elapsed_secs = 0.0;
+        self.audio_handle
+            .send(crate::audio::AudioCmd::Play(song.path.clone()));
+        Ok(song)
+    }
+
+    /// Move the entry at `pos` (1-based) to a new position in the queue.
+    pub fn reorder_queue(&mut self, from: usize, to: usize) -> Result<(), String> {
+        if from == 0 || to == 0 {
+            return Err("positions are 1-based".to_string());
+        }
+        if from > self.queue.len() || to > self.queue.len() {
+            return Err(format!(
+                "position out of range (queue has {} song(s))",
+                self.queue.len()
+            ));
+        }
+        if from == to {
+            return Ok(());
+        }
+        let song = self.queue.remove(from - 1);
+        self.queue.insert(to - 1, song);
+        {
+            let conn = self.lock_conn();
+            Self::queue_clear_db(&conn).map_err(|e| e.to_string())?;
+            for s in &self.queue {
+                Self::queue_append_db(&conn, s.id).map_err(|e| e.to_string())?;
+            }
+        }
+        self.cycle_snapshot = self.queue.clone();
+        info!("Queue reordered: {from} -> {to}");
+        Ok(())
     }
 
     // ------------------------------------------------------------------
