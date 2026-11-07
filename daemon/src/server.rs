@@ -132,6 +132,7 @@ fn handle(
                 "POST /del {query}",
                 "POST /init {song} (async, returns job id, status 202)",
                 "POST /init/batch {songs:[...]}",
+                "POST /import {path} or {paths:[...]} (add local audio files to the library)",
                 "POST /play/all",
                 "POST /skip",
                 "POST /queue/shuffle",
@@ -407,6 +408,21 @@ fn handle(
                 json_response(202, &serde_json::json!({
                     "job_ids": ids,
                 }))
+            }
+            Err(e) => error_response(e),
+        },
+
+        Route::Import => match import_paths_from_body(&body_text) {
+            Ok(paths) => {
+                // Per-file failures are collected, so a single unreadable
+                // path never rejects the whole batch. The library copy is
+                // local disk I/O (no network), so holding the state guard
+                // here is cheap compared to the yt-dlp routes above.
+                let (imported, failed) = state.import_files(paths);
+                json_response(
+                    200,
+                    &serde_json::json!({ "imported": imported, "failed": failed }),
+                )
             }
             Err(e) => error_response(e),
         },
@@ -724,6 +740,7 @@ enum Route {
     Del,
     InitAsync,
     InitBatch,
+    Import,
     PlayAll,
     Skip,
     QueueShuffle,
@@ -770,6 +787,7 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Post, "/del") => Route::Del,
         (Method::Post, "/init") => Route::InitAsync,
         (Method::Post, "/init/batch") => Route::InitBatch,
+        (Method::Post, "/import") => Route::Import,
         (Method::Post, "/play/all") => Route::PlayAll,
         (Method::Post, "/skip") => Route::Skip,
         (Method::Post, "/queue/shuffle") => Route::QueueShuffle,
@@ -921,6 +939,39 @@ fn name_and_url_from_body(body: &str) -> Result<(String, Option<String>), String
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     Ok((name, url))
+}
+
+/// Parse `/import` bodies: a single `path`/`file` string or a
+/// `paths`/`files` array. Paths are resolved by the daemon process, so
+/// clients talking to a remote daemon must send paths that exist there.
+fn import_paths_from_body(body: &str) -> Result<Vec<String>, String> {
+    let v = parse_body(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    if let Some(arr) = v
+        .get("paths")
+        .or_else(|| v.get("files"))
+        .and_then(|x| x.as_array())
+    {
+        let out: Vec<String> = arr
+            .iter()
+            .filter_map(|s| s.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    if let Some(s) = v
+        .get("path")
+        .or_else(|| v.get("file"))
+        .and_then(|x| x.as_str())
+    {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(vec![s.to_string()]);
+        }
+    }
+    Err("missing 'path' (or 'paths' array) in body".to_string())
 }
 
 fn songs_from_body(body: &str) -> Result<Vec<String>, String> {

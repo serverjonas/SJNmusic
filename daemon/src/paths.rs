@@ -70,6 +70,13 @@ pub fn songs_dir() -> PathBuf {
 }
 
 pub fn song_path(name: &str) -> String {
+    song_path_with_ext(name, "mp3")
+}
+
+/// Same sanitisation as `song_path`, but keeps the caller's extension.
+/// Local-file import uses this so a FLAC or OGG is not stored as `*.mp3`.
+/// `ext` is expected to be lowercase and already validated by the caller.
+pub fn song_path_with_ext(name: &str, ext: &str) -> String {
     let safe: String = name
         .chars()
         .map(|c| {
@@ -82,7 +89,7 @@ pub fn song_path(name: &str) -> String {
         .collect();
 
     let mut p = songs_dir();
-    p.push(format!("{safe}.mp3"));
+    p.push(format!("{safe}.{ext}"));
     p.to_string_lossy().to_string()
 }
 

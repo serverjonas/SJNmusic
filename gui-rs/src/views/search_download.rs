@@ -27,6 +27,27 @@ pub fn show(ui: &mut egui::Ui, app: &mut SJNMusicApp) {
     ui.heading("Search + Download");
     ui.separator();
 
+    // Local files: this view is where music enters the library, so the
+    // import row lives here next to the yt-dlp search. The daemon copies
+    // the file into its songs dir and registers it.
+    ui.horizontal(|ui| {
+        ui.label("Import local file:");
+        let input = ui.add(
+            egui::TextEdit::singleline(&mut app.import_path)
+                .hint_text("/path/to/song.mp3 (mp3, flac, ogg, wav)")
+                .desired_width(f32::INFINITY),
+        );
+        let can_import = !app.import_path.trim().is_empty();
+        let clicked = ui
+            .add_enabled(can_import, egui::Button::new("\u{1F4C1} Import"))
+            .clicked();
+        let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if clicked || (enter && can_import) {
+            start_import(app);
+        }
+    });
+    ui.separator();
+
     ui.horizontal(|ui| {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut app.search_q)
@@ -212,6 +233,51 @@ fn flag_color(f: &str) -> egui::Color32 {
         "long" | "short" => egui::Color32::from_rgb(220, 180, 140),
         _ => egui::Color32::from_rgb(180, 180, 180),
     }
+}
+
+/// Hand the typed path to the daemon's `/import`. Runs off-thread because
+/// the daemon copies the file locally, and refreshes the library cache in
+/// the same worker so the new song shows up without a manual Refresh.
+fn start_import(app: &mut SJNMusicApp) {
+    let path = app.import_path.trim().to_string();
+    if path.is_empty() {
+        return;
+    }
+    app.import_path.clear();
+    let daemon = app.daemon.clone();
+    let import_bus = app.import_bus.clone();
+    let library_bus = app.library_results_bus.clone();
+    std::thread::spawn(move || {
+        let outcome = match daemon.import_file(&path) {
+            Ok(resp) => {
+                let mut lines: Vec<String> = resp
+                    .imported
+                    .iter()
+                    .map(|s| format!("Imported \"{}\"", s.name))
+                    .collect();
+                lines.extend(
+                    resp.failed
+                        .iter()
+                        .map(|f| format!("{}: {}", f.path, f.error)),
+                );
+                let msg = lines.join("; ");
+                if resp.imported.is_empty() {
+                    Err(msg)
+                } else {
+                    Ok(msg)
+                }
+            }
+            Err(e) => Err(format!("Import failed: {e}")),
+        };
+        if let Ok(mut slot) = import_bus.lock() {
+            *slot = Some(outcome);
+        }
+        if let Ok(songs) = daemon.songs() {
+            if let Ok(mut slot) = library_bus.lock() {
+                *slot = Some(songs);
+            }
+        }
+    });
 }
 
 fn start_search(app: &mut SJNMusicApp) {

@@ -81,6 +81,11 @@ pub struct SJNMusicApp {
     /// `search_results` rows.
     pub search_picking: bool,
 
+    /// Local-file import row (Search + Download view): the typed path plus
+    /// the result slot the worker writes its `Ok`/`Err` toast message into.
+    pub import_path: String,
+    pub import_bus: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+
     pub history_data: Vec<HistoryEntry>,
     pub history_loading: bool,
 
@@ -157,6 +162,9 @@ impl SJNMusicApp {
             search_just_downloaded: None,
             search_margin: 30,
             search_picking: false,
+
+            import_path: String::new(),
+            import_bus: Arc::new(std::sync::Mutex::new(None)),
 
             history_data: Vec::new(),
             history_loading: false,
@@ -258,6 +266,20 @@ impl SJNMusicApp {
                 self.search_results = new;
                 self.search_loading = false;
             }
+        }
+        // Import outcome: the worker that ran `/import` also refreshed the
+        // library cache, so all that is left is the toast. Take the value out
+        // of the slot first — `push_toast` needs `&mut self`, which the mutex
+        // guard would otherwise still be borrowing.
+        let import_outcome = self
+            .import_bus
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        match import_outcome {
+            Some(Ok(msg)) => self.push_toast(msg, ToastLevel::Success),
+            Some(Err(msg)) => self.push_toast(msg, ToastLevel::Error),
+            None => {}
         }
     }
 

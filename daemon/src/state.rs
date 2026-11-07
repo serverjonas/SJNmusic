@@ -9,7 +9,13 @@ use serde::{Deserialize, Serialize};
 use strsim::jaro_winkler;
 
 use crate::audio::{probe_duration_secs, AudioHandle};
-use crate::paths::song_path;
+use crate::paths::{song_path, song_path_with_ext};
+
+/// Audio containers accepted by local-file import. Deliberately limited to
+/// what rodio 0.19 can decode out of the box (mp3, flac, vorbis, wav) — an
+/// import that registered an unplayable container would just fail later in
+/// the audio thread, which is worse than rejecting it up front.
+const AUDIO_EXTS: [&str; 5] = ["mp3", "flac", "ogg", "oga", "wav"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Song {
@@ -54,6 +60,14 @@ pub struct Playlist {
     pub id: i64,
     pub name: String,
     pub songs: Vec<Song>,
+}
+
+/// One file that `/import` could not take, with the reason. Returned next to
+/// the successfully imported songs so a batch never fails as a whole.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportFailure {
+    pub path: String,
+    pub error: String,
 }
 
 /// Repeat behaviour: `Off` is the default; `One` re-queues the same track when
@@ -608,6 +622,128 @@ impl DaemonState {
             path,
             duration_secs: None,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Local file import
+    // ------------------------------------------------------------------
+
+    /// Import a file that already exists on this machine into the library.
+    ///
+    /// The file is copied into the library directory (the same place yt-dlp
+    /// downloads land) so `delete` removes it from disk just like a download,
+    /// and it is registered under its file stem. Name collisions get a
+    /// ` (2)`, ` (3)`, … suffix instead of overwriting anything.
+    ///
+    /// The copy happens while the caller holds the state mutex; imports are
+    /// local files (a few MB), so this is far cheaper than a yt-dlp download
+    /// and never blocks on the network.
+    pub fn import_file(&mut self, src: &str) -> Result<Song, String> {
+        let src_path = std::path::PathBuf::from(src);
+        let meta = std::fs::metadata(&src_path).map_err(|e| format!("cannot read {src}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("not a file: {src}"));
+        }
+
+        let ext = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !AUDIO_EXTS.contains(&ext.as_str()) {
+            return Err(format!(
+                "unsupported audio format '.{ext}' (supported: {})",
+                AUDIO_EXTS.join(", ")
+            ));
+        }
+
+        let stem = src_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("import");
+
+        let name = self.unique_song_name(stem, &ext);
+        let dest = song_path_with_ext(&name, &ext);
+
+        // Re-importing a file that already sits at the destination would
+        // make `fs::copy` truncate the source it is reading from.
+        let same_file = std::fs::canonicalize(&src_path).ok()
+            == std::fs::canonicalize(&dest).ok();
+        if !same_file {
+            if let Some(parent) = std::path::Path::new(&dest).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(&src_path, &dest)
+                .map_err(|e| format!("failed to copy to {dest}: {e}"))?;
+        }
+
+        let conn = self.lock_conn();
+        let id = Self::insert_song(&conn, &name, &dest).map_err(|e| e.to_string())?;
+        let duration_secs = probe_duration_secs(&dest);
+        if let Some(secs) = duration_secs {
+            if let Err(e) = Self::update_duration_secs(&conn, id, secs) {
+                warn!("Could not update duration_secs for {name}: {e}");
+            }
+        }
+        drop(conn);
+
+        info!("Imported {src} as {name} (id={id}) at {dest}");
+        Ok(Song {
+            id,
+            name,
+            path: dest,
+            duration_secs,
+        })
+    }
+
+    /// Import every path, collecting per-file failures so one bad file does
+    /// not abort a whole batch. Never panics: each error becomes an
+    /// `ImportFailure` the CLI/GUI can render.
+    pub fn import_files(&mut self, paths: Vec<String>) -> (Vec<Song>, Vec<ImportFailure>) {
+        let mut imported = Vec::new();
+        let mut failed = Vec::new();
+        for path in paths {
+            match self.import_file(&path) {
+                Ok(song) => imported.push(song),
+                Err(e) => {
+                    warn!("import failed for {path}: {e}");
+                    failed.push(ImportFailure { path, error: e });
+                }
+            }
+        }
+        (imported, failed)
+    }
+
+    /// Pick a song name that collides with neither an existing DB row nor a
+    /// file already in the library dir. `base` is kept intact; only the
+    /// suffix is added (`name`, `name (2)`, `name (3)`, …).
+    fn unique_song_name(&self, base: &str, ext: &str) -> String {
+        let conn = self.lock_conn();
+        let mut n = 1usize;
+        loop {
+            let candidate = if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base} ({n})")
+            };
+            let in_db: bool = conn
+                .query_row("SELECT 1 FROM songs WHERE name = ?1", params![candidate], |_| {
+                    Ok(())
+                })
+                .is_ok();
+            let on_disk = std::path::Path::new(&song_path_with_ext(&candidate, ext)).exists();
+            if !in_db && !on_disk {
+                return candidate;
+            }
+            n += 1;
+            if n > 999 {
+                // Pathological fallback: never loop forever on a directory
+                // the daemon cannot fully enumerate.
+                return format!("{base} ({})", unix_secs());
+            }
+        }
     }
 
     /// Fetch `limit` yt-dlp search candidates for `query` without downloading.

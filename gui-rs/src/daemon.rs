@@ -300,6 +300,23 @@ pub struct InitBatchResponse {
     pub job_ids: Vec<i64>,
 }
 
+/// One file `/import` rejected, with the daemon's reason.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportFailure {
+    pub path: String,
+    pub error: String,
+}
+
+/// `POST /import` ack: songs that made it into the library plus any
+/// per-file failures (a batch never fails as a whole).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportResponse {
+    #[serde(default)]
+    pub imported: Vec<Song>,
+    #[serde(default)]
+    pub failed: Vec<ImportFailure>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShuffledResponse {
     pub shuffled: bool,
@@ -589,6 +606,13 @@ impl DaemonClient {
 
     pub fn init_batch(&self, songs: Vec<String>) -> Result<InitBatchResponse, DaemonError> {
         self.post_json("/init/batch", &serde_json::json!({"songs": songs}))
+    }
+
+    /// Add a file that already exists on the daemon's machine to the
+    /// library. The daemon copies it into its songs dir and probes the
+    /// duration, so this returns the registered `Song`.
+    pub fn import_file(&self, path: &str) -> Result<ImportResponse, DaemonError> {
+        self.post_json("/import", &serde_json::json!({ "path": path }))
     }
 
     pub fn create_playlist(&self, name: &str) -> Result<Playlist, DaemonError> {

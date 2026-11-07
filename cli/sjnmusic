@@ -154,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
     init_batch = sub.add_parser("init-batch", help="batch-download several songs at once")
     init_batch.add_argument("queries", nargs="+")
 
+    imp = sub.add_parser(
+        "import", help="add local audio files (mp3/flac/ogg/wav) to the library"
+    )
+    imp.add_argument("paths", nargs="+", help="file path(s) to import")
+
     return p
 
 
@@ -555,6 +560,15 @@ def print_response(args, status, payload):
         else:
             print("now playing: (idle)")
         return
+    if isinstance(obj, dict) and "imported" in obj:
+        for s in obj["imported"]:
+            print(f"imported [{s['id']}] {s['name']}")
+        failed = obj.get("failed") or []
+        for f in failed:
+            print(f"failed: {f.get('path')}: {f.get('error')}", file=sys.stderr)
+        if failed and not obj["imported"]:
+            sys.exit(1)
+        return
     if isinstance(obj, dict) and "removed" in obj:
         r = obj["removed"]
         print(f"removed [{r['id']}] {r['name']} (queue now {obj.get('len', '?')} song(s))")
@@ -651,6 +665,10 @@ def main(argv=None):
     elif args.cmd == "init-batch":
         status, payload = request(
             args, host, port, "POST", "/init/batch", body={"songs": args.queries}
+        )
+    elif args.cmd == "import":
+        status, payload = request(
+            args, host, port, "POST", "/import", body={"paths": args.paths}
         )
     elif args.cmd == "search":
         if not q:
