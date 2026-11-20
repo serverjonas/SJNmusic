@@ -104,6 +104,111 @@ impl Default for DownloadConfig {
     }
 }
 
+/// Automatic music-metadata recognition via AcoustID + MusicBrainz.
+///
+/// Every field is optional/defaulted so existing config files keep
+/// parsing untouched. The AcoustID key is deliberately NOT hard-coded:
+/// without a configured key the scanner simply reports "not configured"
+/// and the library keeps working exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataConfig {
+    /// Automatically recognize songs after import/download.
+    #[serde(default = "default_true")]
+    pub auto_recognize: bool,
+    /// Write recognized metadata back into the audio file's tags.
+    #[serde(default = "default_true")]
+    pub write_tags: bool,
+    /// AcoustID client API key (https://acoustid.org/new-application).
+    #[serde(default)]
+    pub acoustid_api_key: String,
+    /// Minimum AcoustID score in [0, 1] accepted for automatic matching.
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f64,
+    /// What to do when several AcoustID candidates are equally good:
+    /// "skip" (mark as ambiguous, keep existing data) or "best" (take the
+    /// highest-scored candidate).
+    #[serde(default = "default_multi_match")]
+    pub multi_match_policy: String,
+    /// Enrich AcoustID hits with MusicBrainz recording data.
+    #[serde(default = "default_true")]
+    pub use_musicbrainz: bool,
+    /// HTTP User-Agent (MusicBrainz requires a meaningful one).
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+    #[serde(default = "default_musicbrainz_endpoint")]
+    pub musicbrainz_endpoint: String,
+    #[serde(default = "default_acoustid_endpoint")]
+    pub acoustid_endpoint: String,
+    /// How long HTTP lookup results may be reused from the local cache.
+    /// `0` disables cache reads (force scans always bypass it).
+    #[serde(default = "default_cache_days")]
+    pub cache_days: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_min_confidence() -> f64 {
+    0.7
+}
+
+fn default_multi_match() -> String {
+    "skip".to_string()
+}
+
+fn default_user_agent() -> String {
+    "sjnmusicd/0.1 (https://github.com/sjnmusic)".to_string()
+}
+
+fn default_musicbrainz_endpoint() -> String {
+    "https://musicbrainz.org/ws/2/".to_string()
+}
+
+fn default_acoustid_endpoint() -> String {
+    "https://api.acoustid.org/v2/lookup".to_string()
+}
+
+fn default_cache_days() -> u64 {
+    30
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            auto_recognize: true,
+            write_tags: true,
+            acoustid_api_key: String::new(),
+            min_confidence: default_min_confidence(),
+            multi_match_policy: default_multi_match(),
+            use_musicbrainz: true,
+            user_agent: default_user_agent(),
+            musicbrainz_endpoint: default_musicbrainz_endpoint(),
+            acoustid_endpoint: default_acoustid_endpoint(),
+            cache_days: default_cache_days(),
+        }
+    }
+}
+
+impl MetadataConfig {
+    pub fn acoustid_configured(&self) -> bool {
+        !self.acoustid_api_key.trim().is_empty()
+    }
+
+    pub fn multi_match_policy(&self) -> MultiMatchPolicy {
+        match self.multi_match_policy.trim().to_ascii_lowercase().as_str() {
+            "best" | "take_best" => MultiMatchPolicy::Best,
+            _ => MultiMatchPolicy::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiMatchPolicy {
+    Skip,
+    Best,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -116,6 +221,8 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub download: DownloadConfig,
+    #[serde(default)]
+    pub metadata: MetadataConfig,
     /// When `true`, the daemon requires `Authorization: Bearer <token>`
     /// for any request whose peer is NOT a loopback address. The matching
     /// `auth_token` is auto-generated at startup if it is still empty
@@ -144,6 +251,15 @@ impl Config {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
         })?;
         fs::write(&path, serialized)
+    }
+
+    /// Persist only the `[metadata]` section, preserving every other
+    /// section in the file. Used by the GUI's Music Metadata settings.
+    pub fn save_metadata(metadata: &MetadataConfig) -> std::io::Result<()> {
+        // Load first so unknown/user-edited sections survive the rewrite.
+        let mut cfg = Config::load();
+        cfg.metadata = metadata.clone();
+        cfg.save()
     }
 
     /// Load configuration from the TOML file. If the file does not exist, create

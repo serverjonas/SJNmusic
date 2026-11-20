@@ -22,6 +22,14 @@ serde_json = "1"
 # Thumbnail decoding for the yt-dlp search picker.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
+# Native "Browse…" file picker for the local-import row. The default
+# backend is XDG Desktop Portal rather than `gtk3`, so the GUI keeps zero
+# GTK build/runtime dependencies (matching the frameless winit setup) — it
+# needs `xdg-desktop-portal` plus a portal implementation at runtime. The
+# sync `pick_file()` only ever runs on a worker thread; calling it from
+# `App::update` would freeze the window for as long as the dialog is open.
+rfd = "0.17"
+
 # System tray (with graceful runtime fallback for headless systems).
 # `default-features = false` opts out of tray-icon's `libxdo` sub-feature,
 # which would otherwise force a system link against `libxdo.so` (vendored

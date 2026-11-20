@@ -9,7 +9,7 @@
                       // each release. Keeps API surface stable while the
                       // fields aren't yet wired up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -17,7 +17,10 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui::TextureHandle;
 
-use crate::daemon::{DaemonClient, DownloadJob, HistoryEntry, NowPlaying, Playlist, QueueSnapshot, RankedCandidate, Song, Stats};
+use crate::daemon::{
+    DaemonClient, DownloadJob, HistoryEntry, MetadataSettings, MetadataStatus, NowPlaying,
+    Playlist, QueueSnapshot, RankedCandidate, ScanStatus, ServiceTestResult, Song, Stats,
+};
 use crate::state::{AppState, Route, Theme, TickMessage, Toast, ToastLevel};
 use crate::thumbnails::ImageMessage;
 use crate::tray::TraySignals;
@@ -84,13 +87,39 @@ pub struct SJNMusicApp {
     /// Local-file import row (Search + Download view): the typed path plus
     /// the result slot the worker writes its `Ok`/`Err` toast message into.
     pub import_path: String,
+    /// Direct audio-file URL row in Search + Download.
+    pub direct_url: String,
     pub import_bus: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    /// Path returned by the native "Browse…" dialog. The picker blocks on a
+    /// worker thread, so the choice is parked here and drained into
+    /// `import_path` on the next `update()`; `None` means no pick (yet or
+    /// cancelled).
+    pub import_pick_bus: Arc<std::sync::Mutex<Option<String>>>,
 
     pub history_data: Vec<HistoryEntry>,
     pub history_loading: bool,
 
     pub stats_data: Option<Stats>,
     pub stats_loading: bool,
+
+    // ---- Music metadata / scan ------------------------------------------
+    pub metadata_settings: Option<MetadataSettings>,
+    pub metadata_settings_loading: bool,
+    pub metadata_settings_attempted: bool,
+    pub metadata_settings_bus:
+        Arc<std::sync::Mutex<Option<Result<(MetadataSettings, MetadataStatus), String>>>>,
+    pub metadata_status: Option<MetadataStatus>,
+    pub show_acoustid_key: bool,
+    pub metadata_test_msg: Option<(bool, String)>,
+    pub metadata_test_bus:
+        Arc<std::sync::Mutex<Option<Result<ServiceTestResult, String>>>>,
+    pub scan_status: Option<ScanStatus>,
+    pub scan_polling: bool,
+    pub last_scan_poll: std::time::Instant,
+
+    // ---- Song detail / selection ----------------------------------------
+    pub selected_songs: HashSet<i64>,
+    pub song_detail: Option<Song>,
 }
 
 impl SJNMusicApp {
@@ -164,13 +193,31 @@ impl SJNMusicApp {
             search_picking: false,
 
             import_path: String::new(),
+            direct_url: String::new(),
             import_bus: Arc::new(std::sync::Mutex::new(None)),
+            import_pick_bus: Arc::new(std::sync::Mutex::new(None)),
 
             history_data: Vec::new(),
             history_loading: false,
 
             stats_data: None,
             stats_loading: false,
+
+            metadata_settings: None,
+            metadata_settings_loading: false,
+            metadata_settings_attempted: false,
+            metadata_settings_bus: Arc::new(std::sync::Mutex::new(None)),
+            metadata_status: None,
+            show_acoustid_key: false,
+            metadata_test_msg: None,
+            metadata_test_bus: Arc::new(std::sync::Mutex::new(None)),
+            scan_status: None,
+            scan_polling: false,
+            last_scan_poll: std::time::Instant::now()
+                - std::time::Duration::from_secs(10),
+
+            selected_songs: HashSet::new(),
+            song_detail: None,
         }
     }
 
@@ -267,6 +314,16 @@ impl SJNMusicApp {
                 self.search_loading = false;
             }
         }
+        // Native picker: the "Browse…" worker blocks inside rfd, so the chosen
+        // path arrives here instead of being written from `update()`.
+        let picked = self
+            .import_pick_bus
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(path) = picked {
+            self.import_path = path;
+        }
         // Import outcome: the worker that ran `/import` also refreshed the
         // library cache, so all that is left is the toast. Take the value out
         // of the slot first — `push_toast` needs `&mut self`, which the mutex
@@ -280,6 +337,52 @@ impl SJNMusicApp {
             Some(Ok(msg)) => self.push_toast(msg, ToastLevel::Success),
             Some(Err(msg)) => self.push_toast(msg, ToastLevel::Error),
             None => {}
+        }
+
+        // Music-metadata settings + library counts (loaded once, or via the
+        // explicit Reload button in Settings).
+        let meta_settings = self
+            .metadata_settings_bus
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(result) = meta_settings {
+            self.metadata_settings_loading = false;
+            match result {
+                Ok((settings, status)) => {
+                    self.metadata_settings = Some(settings);
+                    self.metadata_status = Some(status);
+                }
+                Err(e) => self.push_toast(
+                    format!("Metadata settings: {e}"),
+                    ToastLevel::Error,
+                ),
+            }
+        }
+
+        let service_test = self
+            .metadata_test_bus
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(result) = service_test {
+            match result {
+                Ok(r) => {
+                    self.metadata_test_msg = Some((r.ok, r.message.clone()));
+                    self.push_toast(
+                        r.message,
+                        if r.ok {
+                            ToastLevel::Success
+                        } else {
+                            ToastLevel::Error
+                        },
+                    );
+                }
+                Err(e) => {
+                    self.metadata_test_msg = Some((false, e.clone()));
+                    self.push_toast(e, ToastLevel::Error);
+                }
+            }
         }
     }
 

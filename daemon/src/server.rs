@@ -6,6 +6,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::audio::AudioCmd;
 use crate::auth;
+use crate::config::MetadataConfig;
+use crate::metadata;
+use crate::scan;
 use crate::state::{init_async, init_batch, DaemonState, RepeatMode};
 use crate::youtube::{pick_best, rank_query, AUTO_PICK_MARGIN};
 
@@ -115,6 +118,7 @@ fn handle(
                 "GET  /auth/token (localhost-only; returns the bearer token when auth is enabled)",
                 "POST /auth/pair (localhost-only; pairing-style token endpoint, currently returns the same token as /auth/token)",
                 "GET  /songs?q=",
+                "GET  /songs/{id} (full metadata + original source)",
                 "GET  /search?q=... (best match) or POST /search {query}",
                 "GET  /search/all?q=... (every match above threshold)",
                 "GET  /search/yt?q=...&limit=N (raw yt-dlp candidates for picker)",
@@ -130,9 +134,18 @@ fn handle(
                 "POST /play {query}",
                 "POST /add {query}",
                 "POST /del {query}",
-                "POST /init {song} (async, returns job id, status 202)",
+                "POST /init {song} or {name?, url} (async; url may be an audio-file URL)",
                 "POST /init/batch {songs:[...]}",
                 "POST /import {path} or {paths:[...]} (add local audio files to the library)",
+                "GET  /metadata/status",
+                "GET  /metadata/settings",
+                "POST /metadata/settings (update the [metadata] config section)",
+                "POST /metadata/test {service: acoustid|musicbrainz}",
+                "POST /metadata/scan {force} (start a library scan)",
+                "GET  /metadata/scan (progress / result)",
+                "POST /metadata/scan/cancel",
+                "POST /metadata/recognize {song_id|query, force}",
+                "POST /metadata/sync {song_id|query} (DB -> file tags)",
                 "POST /play/all",
                 "POST /skip",
                 "POST /queue/shuffle",
@@ -238,6 +251,101 @@ fn handle(
                 "songs": state.list_songs_filtered(q),
             }))
         }
+
+        Route::SongDetail(id) => match state.all_songs().into_iter().find(|s| s.id == id) {
+            Some(song) => json_response(200, &song),
+            None => json_response(
+                404,
+                &ApiError {
+                    error: format!("song not found: {id}"),
+                },
+            ),
+        },
+
+        Route::MetadataStatus => json_response(200, &metadata::status_summary()),
+
+        Route::MetadataSettingsGet => json_response(200, &metadata::current_config()),
+
+        Route::MetadataSettingsSet => match serde_json::from_str::<MetadataConfig>(&body_text) {
+            Ok(new_cfg) => {
+                let cfg = MetadataConfig {
+                    acoustid_api_key: new_cfg.acoustid_api_key.trim().to_string(),
+                    min_confidence: new_cfg.min_confidence.clamp(0.0, 1.0),
+                    ..new_cfg
+                };
+                match crate::config::Config::save_metadata(&cfg) {
+                    Ok(()) => {
+                        metadata::set_config(&cfg);
+                        info!("Metadata settings updated");
+                        json_response(200, &cfg)
+                    }
+                    Err(e) => error_response(format!("could not save config: {e}")),
+                }
+            }
+            Err(e) => error_response(format!("invalid settings body: {e}")),
+        },
+
+        Route::MetadataTest => {
+            let service = parse_body(&body_text)
+                .ok()
+                .and_then(|v| {
+                    v.get("service")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            // The probe can take up to the HTTP timeout; never hold the
+            // daemon state lock across it.
+            drop(state);
+            match metadata::test_service(&service) {
+                Ok(message) => json_response(200, &serde_json::json!({
+                    "ok": true, "message": message,
+                })),
+                Err(message) => json_response(200, &serde_json::json!({
+                    "ok": false, "message": message,
+                })),
+            }
+        }
+
+        Route::MetadataScanStart => {
+            let force = parse_body(&body_text)
+                .ok()
+                .and_then(|v| v.get("force").and_then(|f| f.as_bool()))
+                .unwrap_or(false);
+            match scan::start(force) {
+                Ok(st) => json_response(202, &st),
+                Err(e) => json_response(409, &ApiError { error: e }),
+            }
+        }
+
+        Route::MetadataScanStatus => json_response(200, &scan::status()),
+
+        Route::MetadataScanCancel => {
+            let cancelled = scan::cancel();
+            json_response(200, &serde_json::json!({ "cancelled": cancelled }))
+        }
+
+        Route::MetadataRecognize => match metadata_target_from_body(&state, &body_text) {
+            Ok((id, _name, force)) => {
+                metadata::spawn_recognize(id, force);
+                json_response(
+                    202,
+                    &serde_json::json!({ "queued": true, "song_id": id }),
+                )
+            }
+            Err(e) => error_response(e),
+        },
+
+        Route::MetadataSync => match metadata_target_from_body(&state, &body_text) {
+            Ok((id, _name, _force)) => {
+                metadata::spawn_sync_to_file(id);
+                json_response(
+                    202,
+                    &serde_json::json!({ "queued": true, "song_id": id }),
+                )
+            }
+            Err(e) => error_response(e),
+        },
 
         Route::Search => match query_or_body(&query_params, &body_text) {
             Ok(q) => match state.search(&q) {
@@ -419,10 +527,19 @@ fn handle(
                 // local disk I/O (no network), so holding the state guard
                 // here is cheap compared to the yt-dlp routes above.
                 let (imported, failed) = state.import_files(paths);
-                json_response(
+                let new_ids: Vec<i64> = imported.iter().map(|s| s.id).collect();
+                let response = json_response(
                     200,
                     &serde_json::json!({ "imported": imported, "failed": failed }),
-                )
+                );
+                // Recognition runs after the import response has been
+                // assembled and the state guard is dropped; with no API
+                // key configured this is a cheap no-op.
+                drop(state);
+                for id in new_ids {
+                    metadata::maybe_recognize_async(id);
+                }
+                response
             }
             Err(e) => error_response(e),
         },
@@ -725,6 +842,16 @@ enum Route {
     AuthTokenGet,
     AuthPair,
     Songs,
+    SongDetail(i64),
+    MetadataStatus,
+    MetadataSettingsGet,
+    MetadataSettingsSet,
+    MetadataTest,
+    MetadataScanStart,
+    MetadataScanStatus,
+    MetadataScanCancel,
+    MetadataRecognize,
+    MetadataSync,
     Search,
     SearchAll,
     SearchYt,
@@ -773,6 +900,19 @@ fn route_for(method: &Method, path: &str) -> Route {
         (Method::Get, "/auth/token") => Route::AuthTokenGet,
         (Method::Post, "/auth/pair") => Route::AuthPair,
         (Method::Get, "/songs") => Route::Songs,
+        (Method::Get, path) if path.starts_with("/songs/") => path["/songs/".len()..]
+            .parse::<i64>()
+            .map(Route::SongDetail)
+            .unwrap_or(Route::NotFound),
+        (Method::Get, "/metadata/status") => Route::MetadataStatus,
+        (Method::Get, "/metadata/settings") => Route::MetadataSettingsGet,
+        (Method::Post, "/metadata/settings") => Route::MetadataSettingsSet,
+        (Method::Post, "/metadata/test") => Route::MetadataTest,
+        (Method::Post, "/metadata/scan") => Route::MetadataScanStart,
+        (Method::Get, "/metadata/scan") => Route::MetadataScanStatus,
+        (Method::Post, "/metadata/scan/cancel") => Route::MetadataScanCancel,
+        (Method::Post, "/metadata/recognize") => Route::MetadataRecognize,
+        (Method::Post, "/metadata/sync") => Route::MetadataSync,
         (m, "/search") if matches!(m, Method::Get | Method::Post) => Route::Search,
         (Method::Get, "/search/all") => Route::SearchAll,
         (Method::Get, "/search/yt/ranked") => Route::SearchYtRanked,
@@ -911,6 +1051,42 @@ fn query_or_body(
     Err("missing 'query' parameter".to_string())
 }
 
+/// Resolve a metadata action target from `{song_id}` or a search query.
+/// Returns `(id, name, force)`. Resolution uses the in-memory/DB song list,
+/// so the caller can accept either a GUI-selected id or a CLI query.
+fn metadata_target_from_body(
+    state: &DaemonState,
+    body: &str,
+) -> Result<(i64, String, bool), String> {
+    let v = parse_body(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let force = v
+        .get("force")
+        .and_then(|f| f.as_bool())
+        .unwrap_or(false);
+    if let Some(id) = v.get("song_id").and_then(|x| x.as_i64()) {
+        let song = state
+            .all_songs()
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("song not found: {id}"))?;
+        return Ok((song.id, song.name, force));
+    }
+    for key in ["query", "name", "song"] {
+        if let Some(q) = v
+            .get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let song = state
+                .search(q)
+                .ok_or_else(|| format!("song not found: {q}"))?;
+            return Ok((song.id, song.name, force));
+        }
+    }
+    Err("missing 'song_id' or 'query' in body".to_string())
+}
+
 fn name_from_body(body: &str) -> Result<String, String> {
     let v = parse_body(body).map_err(|e| format!("invalid JSON body: {e}"))?;
     if let Some(obj) = v.as_object() {
@@ -930,7 +1106,6 @@ fn name_from_body(body: &str) -> Result<String, String> {
 /// name; `url` is optional and falls back to `ytsearch1:NAME` on the caller
 /// side (kept here as `None` for clarity rather than pre-formatted).
 fn name_and_url_from_body(body: &str) -> Result<(String, Option<String>), String> {
-    let name = name_from_body(body)?;
     let v = parse_body(body).map_err(|e| format!("invalid JSON body: {e}"))?;
     let url = v
         .as_object()
@@ -938,6 +1113,24 @@ fn name_and_url_from_body(body: &str) -> Result<(String, Option<String>), String
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let name = v
+        .as_object()
+        .and_then(|obj| {
+            for key in ["name", "song", "query"] {
+                if let Some(s) = obj.get(key).and_then(|x| x.as_str()) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+            None
+        })
+        // A URL-only request is valid: derive the display/storage name from
+        // the file component. Direct audio URLs are validated later by the
+        // download worker.
+        .or_else(|| url.as_deref().map(crate::remote::derive_name_from_url))
+        .ok_or_else(|| "missing 'name' or 'url' in body".to_string())?;
     Ok((name, url))
 }
 

@@ -4,12 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use strsim::jaro_winkler;
 
 use crate::audio::{probe_duration_secs, AudioHandle};
-use crate::paths::{song_path, song_path_with_ext};
+use crate::paths::{song_path, song_path_with_ext, songs_dir};
+use crate::remote;
 
 /// Audio containers accepted by local-file import. Deliberately limited to
 /// what rodio 0.19 can decode out of the box (mp3, flac, vorbis, wav) — an
@@ -17,7 +19,7 @@ use crate::paths::{song_path, song_path_with_ext};
 /// the audio thread, which is worse than rejecting it up front.
 const AUDIO_EXTS: [&str; 5] = ["mp3", "flac", "ogg", "oga", "wav"];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Song {
     pub id: i64,
     pub name: String,
@@ -27,6 +29,205 @@ pub struct Song {
     /// it up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<f64>,
+
+    // ---- MusicBrainz identifiers ------------------------------------
+    #[serde(default)]
+    pub musicbrainz_recording_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_release_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_release_group_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_artist_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_release_artist_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_work_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_track_id: Option<String>,
+
+    // ---- AcoustID ---------------------------------------------------
+    #[serde(default)]
+    pub acoustid_id: Option<String>,
+    #[serde(default)]
+    pub acoustid_score: Option<f64>,
+    #[serde(default)]
+    pub acoustid_fingerprint: Option<String>,
+    #[serde(default)]
+    pub acoustid_last_checked_at: Option<i64>,
+
+    // ---- General metadata -------------------------------------------
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub album_artist: Option<String>,
+    #[serde(default)]
+    pub composer: Option<String>,
+    #[serde(default)]
+    pub songwriter: Option<String>,
+    #[serde(default)]
+    pub arranger: Option<String>,
+    #[serde(default)]
+    pub performer: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub original_release_date: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<i64>,
+    #[serde(default)]
+    pub track_number: Option<i64>,
+    #[serde(default)]
+    pub track_total: Option<i64>,
+    #[serde(default)]
+    pub disc_number: Option<i64>,
+    #[serde(default)]
+    pub disc_total: Option<i64>,
+    #[serde(default)]
+    pub genre: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
+    pub recording_location: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub isrc: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub catalog_number: Option<String>,
+    #[serde(default)]
+    pub barcode: Option<String>,
+    #[serde(default)]
+    pub release_type: Option<String>,
+    #[serde(default)]
+    pub release_country: Option<String>,
+    #[serde(default)]
+    pub bpm: Option<f64>,
+    #[serde(default)]
+    pub musical_key: Option<String>,
+
+    // ---- Technical bookkeeping --------------------------------------
+    #[serde(default)]
+    pub metadata_source: Option<String>,
+    #[serde(default)]
+    pub metadata_confidence: Option<f64>,
+    #[serde(default)]
+    pub metadata_last_updated_at: Option<i64>,
+    #[serde(default)]
+    pub metadata_last_checked_at: Option<i64>,
+    #[serde(default)]
+    pub metadata_status: Option<String>,
+    #[serde(default)]
+    pub metadata_error: Option<String>,
+
+    // ---- Original source (never rewritten by metadata scans) --------
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub source_identifier: Option<String>,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_platform: Option<String>,
+    #[serde(default)]
+    pub source_created_at: Option<i64>,
+    #[serde(default)]
+    pub source_metadata: Option<String>,
+}
+
+impl Song {
+    /// A song counts as "complete" when recognition succeeded and the two
+    /// fields every consumer needs (title + artist) plus at least one
+    /// service identifier are present. `scan` skips these rows.
+    pub fn is_metadata_complete(&self) -> bool {
+        let non_empty = |v: &Option<String>| {
+            v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        };
+        self.metadata_status.as_deref() == Some("recognized")
+            && non_empty(&self.title)
+            && non_empty(&self.artist)
+            && (non_empty(&self.musicbrainz_recording_id) || non_empty(&self.acoustid_id))
+    }
+}
+
+/// Map a `SELECT ... FROM songs` row (column-name based) into `Song`. Using
+/// names instead of ordinals keeps every caller in sync as columns are
+/// added by migrations.
+pub(crate) fn song_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Song> {
+    let s = |name: &str| row.get::<_, Option<String>>(name).unwrap_or(None);
+    let i = |name: &str| row.get::<_, Option<i64>>(name).unwrap_or(None);
+    let f = |name: &str| row.get::<_, Option<f64>>(name).unwrap_or(None);
+    Ok(Song {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        path: row.get("path")?,
+        duration_secs: f("duration_secs"),
+        musicbrainz_recording_id: s("musicbrainz_recording_id"),
+        musicbrainz_release_id: s("musicbrainz_release_id"),
+        musicbrainz_release_group_id: s("musicbrainz_release_group_id"),
+        musicbrainz_artist_id: s("musicbrainz_artist_id"),
+        musicbrainz_release_artist_id: s("musicbrainz_release_artist_id"),
+        musicbrainz_work_id: s("musicbrainz_work_id"),
+        musicbrainz_track_id: s("musicbrainz_track_id"),
+        acoustid_id: s("acoustid_id"),
+        acoustid_score: f("acoustid_score"),
+        acoustid_fingerprint: s("acoustid_fingerprint"),
+        acoustid_last_checked_at: i("acoustid_last_checked_at"),
+        title: s("title"),
+        artist: s("artist"),
+        album: s("album"),
+        album_artist: s("album_artist"),
+        composer: s("composer"),
+        songwriter: s("songwriter"),
+        arranger: s("arranger"),
+        performer: s("performer"),
+        release_date: s("release_date"),
+        original_release_date: s("original_release_date"),
+        release_year: i("release_year"),
+        track_number: i("track_number"),
+        track_total: i("track_total"),
+        disc_number: i("disc_number"),
+        disc_total: i("disc_total"),
+        genre: s("genre"),
+        tags: s("tags"),
+        style: s("style"),
+        recording_location: s("recording_location"),
+        language: s("language"),
+        isrc: s("isrc"),
+        label: s("label"),
+        catalog_number: s("catalog_number"),
+        barcode: s("barcode"),
+        release_type: s("release_type"),
+        release_country: s("release_country"),
+        bpm: f("bpm"),
+        musical_key: s("musical_key"),
+        metadata_source: s("metadata_source"),
+        metadata_confidence: f("metadata_confidence"),
+        metadata_last_updated_at: i("metadata_last_updated_at"),
+        metadata_last_checked_at: i("metadata_last_checked_at"),
+        metadata_status: s("metadata_status"),
+        metadata_error: s("metadata_error"),
+        source_type: s("source_type"),
+        source_url: s("source_url"),
+        source_path: s("source_path"),
+        source_identifier: s("source_identifier"),
+        source_title: s("source_title"),
+        source_platform: s("source_platform"),
+        source_created_at: i("source_created_at"),
+        source_metadata: s("source_metadata"),
+    })
 }
 
 /// One row of the result set returned by `/search/yt`. Built directly from
@@ -213,7 +414,7 @@ impl DaemonState {
 
     fn load_queue_from_db(conn: &Connection) -> Vec<Song> {
         let mut stmt = match conn.prepare(
-            "SELECT s.id, s.name, s.path, s.duration_secs
+            "SELECT s.*
              FROM queue q JOIN songs s ON s.id = q.song_id
              ORDER BY q.position ASC",
         ) {
@@ -224,16 +425,9 @@ impl DaemonState {
             }
         };
 
-        stmt.query_map([], |row| {
-            Ok(Song {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                duration_secs: row.get::<_, Option<f64>>(3).ok().flatten(),
-            })
-        })
-        .map(|it| it.filter_map(Result::ok).collect())
-        .unwrap_or_default()
+        stmt.query_map([], song_from_row)
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 
     /// All songs sorted by name (used internally and by `/songs`).
@@ -255,11 +449,11 @@ impl DaemonState {
     fn list_songs(conn: &Connection, filter: Option<&str>) -> Vec<Song> {
         let (sql, has_filter) = match filter {
             Some(_) => (
-                "SELECT id, name, path, duration_secs FROM songs \
+                "SELECT * FROM songs \
                  WHERE name LIKE ? ESCAPE '\\' ORDER BY name",
                 true,
             ),
-            None => ("SELECT id, name, path, duration_secs FROM songs ORDER BY name", false),
+            None => ("SELECT * FROM songs ORDER BY name", false),
         };
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
@@ -269,18 +463,10 @@ impl DaemonState {
             }
         };
 
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Song> {
-            Ok(Song {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                duration_secs: row.get::<_, Option<f64>>(3).ok().flatten(),
-            })
-        };
         let mapped = if has_filter {
-            stmt.query_map(params![format!("%{}%", filter.unwrap_or(""))], map_row)
+            stmt.query_map(params![format!("%{}%", filter.unwrap_or(""))], song_from_row)
         } else {
-            stmt.query_map([], map_row)
+            stmt.query_map([], song_from_row)
         };
         mapped
             .map(|it| it.filter_map(Result::ok).collect())
@@ -571,6 +757,11 @@ impl DaemonState {
         name: &str,
         source: &str,
     ) -> Result<Song, String> {
+        // A plain audio-file URL is downloaded/validated directly; yt-dlp is
+        // for video pages and `ytsearch` expressions.
+        if remote::is_http_url(source) {
+            return Self::init_remote_sync(state, name, source);
+        }
         let path = song_path(name);
         debug!("yt-dlp target path: {path} | source: {source}");
 
@@ -601,6 +792,13 @@ impl DaemonState {
             return Err(format!("download finished but file missing: {path}"));
         }
 
+        // Resolve the original YouTube source BEFORE taking the state lock
+        // (the ytsearch fallback shells out to yt-dlp). An explicit URL is
+        // used verbatim; a `ytsearchN:` source is resolved once more so the
+        // stored URL/ID describe the actual video that was downloaded.
+        let (src_url, src_id, src_title) = youtube_source_info(source);
+        let duration = probe_duration_secs(&path);
+
         // Acquire the state lock only briefly, for the DB inserts. The
         // lock is never held across the `yt-dlp` call above. `.unwrap()`
         // matches the rest of `state.rs`/`daemon.rs` and a poisoning
@@ -608,7 +806,7 @@ impl DaemonState {
         let daemon = state.lock().unwrap();
         let conn = daemon.lock_conn();
         let id = Self::insert_song(&conn, name, &path).map_err(|e| e.to_string())?;
-        if let Some(secs) = probe_duration_secs(&path) {
+        if let Some(secs) = duration {
             if let Err(e) = Self::update_duration_secs(&conn, id, secs) {
                 warn!("Could not update duration_secs for {name}: {e}");
             }
@@ -616,12 +814,176 @@ impl DaemonState {
         } else {
             info!("Registered song {name} (id={id}) at {path}");
         }
+
+        let now = unix_secs();
+        let source_metadata = serde_json::json!({
+            "requested_source": source,
+            "downloaded_at": now,
+        })
+        .to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE songs SET
+                 source_type       = 'youtube',
+                 source_platform   = 'youtube',
+                 source_url        = ?1,
+                 source_identifier = ?2,
+                 source_title      = ?3,
+                 source_path       = NULL,
+                 source_created_at = ?4,
+                 source_metadata   = ?5
+             WHERE id = ?6 AND (source_type IS NULL OR source_type = '')",
+            params![
+                src_url,
+                src_id,
+                src_title.unwrap_or_else(|| name.to_string()),
+                now,
+                source_metadata,
+                id
+            ],
+        ) {
+            warn!("Could not record YouTube source for {name}: {e}");
+        }
+
         Ok(Song {
             id,
             name: name.to_string(),
             path,
-            duration_secs: None,
+            duration_secs: duration,
+            source_type: Some("youtube".to_string()),
+            source_platform: Some("youtube".to_string()),
+            source_url: src_url,
+            source_identifier: src_id,
+            source_created_at: Some(now),
+            ..Song::default()
         })
+    }
+
+    /// Direct audio-file URL: probe, download, validate, then register with
+    /// the URL as permanent source. Re-initialising the same URL returns the
+    /// existing row instead of downloading a duplicate.
+    fn init_remote_sync(
+        state: &Arc<Mutex<DaemonState>>,
+        name: &str,
+        url: &str,
+    ) -> Result<Song, String> {
+        {
+            let daemon = state.lock().unwrap();
+            let conn = daemon.lock_conn();
+            if let Some(existing) = conn
+                .query_row(
+                    "SELECT * FROM songs WHERE source_url = ?1 LIMIT 1",
+                    params![url],
+                    song_from_row,
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+            {
+                info!(
+                    "URL {} already imported as {} (id={})",
+                    url, existing.name, existing.id
+                );
+                return Ok(existing);
+            }
+        }
+
+        // Validate the link before touching the library directory.
+        let audio = remote::probe_audio_url(url)?;
+        let temp = songs_dir().join(format!(
+            ".incoming-{}-{}.{}",
+            std::process::id(),
+            unix_nanos(),
+            audio.extension
+        ));
+        if let Err(e) = remote::download_to(url, &temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+        if let Err(e) = remote::validate_audio_file(&temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+        let duration = probe_duration_secs(temp.to_string_lossy().as_ref());
+
+        let result = (|| -> Result<Song, String> {
+            let daemon = state.lock().unwrap();
+            let conn = daemon.lock_conn();
+            let display = Self::unique_name(&conn, name, &audio.extension);
+            let dest = song_path_with_ext(&display, &audio.extension);
+            if let Some(parent) = std::path::Path::new(&dest).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::rename(&temp, &dest)
+                .map_err(|e| format!("move download into library: {e}"))?;
+            let id = match Self::insert_song(&conn, &display, &dest) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(e.to_string());
+                }
+            };
+            if let Some(secs) = duration {
+                if let Err(e) = Self::update_duration_secs(&conn, id, secs) {
+                    warn!("Could not update duration_secs for {display}: {e}");
+                }
+            }
+
+            let content_hash = sha256_file(std::path::Path::new(&dest));
+            let now = unix_secs();
+            let platform = audio.host.clone();
+            let source_metadata = serde_json::json!({
+                "requested_url": url,
+                "content_type": audio.content_type.clone(),
+                "content_length": audio.content_length,
+                "original_filename": audio.filename.clone(),
+                "downloaded_at": now,
+            })
+            .to_string();
+            if let Err(e) = conn.execute(
+                "UPDATE songs SET
+                     content_hash      = ?1,
+                     source_type       = 'url',
+                     source_platform   = ?2,
+                     source_url        = ?3,
+                     source_identifier = ?4,
+                     source_title      = ?5,
+                     source_path       = NULL,
+                     source_created_at = ?6,
+                     source_metadata   = ?7
+                 WHERE id = ?8 AND (source_type IS NULL OR source_type = '')",
+                params![
+                    content_hash,
+                    platform,
+                    url,
+                    audio.filename.clone(),
+                    display.clone(),
+                    now,
+                    source_metadata.clone(),
+                    id
+                ],
+            ) {
+                warn!("Could not record URL source for {display}: {e}");
+            }
+
+            info!("Downloaded URL {url} as {display} (id={id}) at {dest}");
+            Ok(Song {
+                id,
+                name: display,
+                path: dest,
+                duration_secs: duration,
+                source_type: Some("url".to_string()),
+                source_platform: audio.host,
+                source_url: Some(url.to_string()),
+                source_identifier: audio.filename,
+                source_title: Some(name.to_string()),
+                source_created_at: Some(now),
+                source_metadata: Some(source_metadata),
+                ..Song::default()
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
 
     // ------------------------------------------------------------------
@@ -664,6 +1026,31 @@ impl DaemonState {
             .filter(|s| !s.is_empty())
             .unwrap_or("import");
 
+        // The original location is recorded BEFORE any copy/move so it can
+        // never be confused with the managed library path later.
+        let canonical_src = std::fs::canonicalize(&src_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| src.to_string());
+        let content_hash = sha256_file(&src_path);
+
+        // Duplicate detection: re-importing the same content or the same
+        // original path returns the existing row, so its source
+        // association is never replaced by a second import.
+        {
+            let conn = self.lock_conn();
+            if let Some(existing) = find_import_duplicate(
+                &conn,
+                &canonical_src,
+                content_hash.as_deref(),
+            ) {
+                info!(
+                    "Re-import of {src} matches existing song {} (id={}); keeping its source",
+                    existing.name, existing.id
+                );
+                return Ok(existing);
+            }
+        }
+
         let name = self.unique_song_name(stem, &ext);
         let dest = song_path_with_ext(&name, &ext);
 
@@ -687,6 +1074,24 @@ impl DaemonState {
                 warn!("Could not update duration_secs for {name}: {e}");
             }
         }
+        let now = unix_secs();
+        let source_metadata = serde_json::json!({
+            "original_filename": src_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            "imported_at": now,
+        })
+        .to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE songs SET
+                 content_hash  = ?1,
+                 source_type   = 'local_file',
+                 source_path   = ?2,
+                 source_created_at = ?3,
+                 source_metadata   = ?4
+             WHERE id = ?5 AND (source_type IS NULL OR source_type = '')",
+            params![content_hash, canonical_src, now, source_metadata, id],
+        ) {
+            warn!("Could not record local source for {name}: {e}");
+        }
         drop(conn);
 
         info!("Imported {src} as {name} (id={id}) at {dest}");
@@ -695,6 +1100,10 @@ impl DaemonState {
             name,
             path: dest,
             duration_secs,
+            source_type: Some("local_file".to_string()),
+            source_path: Some(canonical_src),
+            source_created_at: Some(now),
+            ..Song::default()
         })
     }
 
@@ -720,7 +1129,11 @@ impl DaemonState {
     /// file already in the library dir. `base` is kept intact; only the
     /// suffix is added (`name`, `name (2)`, `name (3)`, …).
     fn unique_song_name(&self, base: &str, ext: &str) -> String {
-        let conn = self.lock_conn();
+        Self::unique_name(&self.lock_conn(), base, ext)
+    }
+
+    /// Shared name-collision helper for imports and direct URL downloads.
+    fn unique_name(conn: &Connection, base: &str, ext: &str) -> String {
         let mut n = 1usize;
         loop {
             let candidate = if n == 1 {
@@ -1188,7 +1601,7 @@ impl DaemonState {
 
     fn load_playlist_songs(conn: &Connection, playlist_id: i64) -> Vec<Song> {
         let mut stmt = match conn.prepare(
-            "SELECT s.id, s.name, s.path, s.duration_secs
+            "SELECT s.*
              FROM playlist_songs ps JOIN songs s ON s.id = ps.song_id
              WHERE ps.playlist_id = ?1
              ORDER BY ps.position ASC",
@@ -1196,16 +1609,9 @@ impl DaemonState {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map(params![playlist_id], |row| {
-            Ok(Song {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                duration_secs: row.get::<_, Option<f64>>(3).ok().flatten(),
-            })
-        })
-        .map(|it| it.filter_map(Result::ok).collect())
-        .unwrap_or_default()
+        stmt.query_map(params![playlist_id], song_from_row)
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 
     pub fn create_playlist(&self, name: &str) -> Result<Playlist, String> {
@@ -1502,6 +1908,107 @@ fn unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// SHA-256 of a file, used only for re-import duplicate detection.
+/// Unreadable files return `None` (the import itself will then fail with a
+/// useful error rather than a hash error).
+fn sha256_file(path: &std::path::Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Look up an existing library row by content hash first (the same bytes
+/// imported from a different path) and original source path second.
+fn find_import_duplicate(
+    conn: &Connection,
+    canonical_src: &str,
+    content_hash: Option<&str>,
+) -> Option<Song> {
+    if let Some(hash) = content_hash {
+        if let Ok(song) = conn
+            .query_row(
+                "SELECT * FROM songs WHERE content_hash = ?1 LIMIT 1",
+                params![hash],
+                song_from_row,
+            )
+            .optional()
+        {
+            return song;
+        }
+    }
+    conn.query_row(
+        "SELECT * FROM songs WHERE source_path = ?1 LIMIT 1",
+        params![canonical_src],
+        song_from_row,
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Extract a YouTube video id from the common URL shapes.
+pub(crate) fn youtube_video_id(url: &str) -> Option<String> {
+    if let Some(rest) = url.split("v=").nth(1) {
+        let id = rest.split(['&', '#']).next().unwrap_or("");
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    for marker in ["youtu.be/", "/shorts/", "/embed/", "/v/"] {
+        if let Some(rest) = url.split(marker).nth(1) {
+            let id = rest.split(['?', '&', '#', '/']).next().unwrap_or("");
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `(webpage_url, video_id, title)` for a download source. Explicit
+/// URLs need no network; legacy `ytsearchN:` sources are resolved via one
+/// lightweight yt-dlp metadata call. Failure keeps the source as `None`
+/// rather than inventing a URL.
+fn youtube_source_info(source: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return (
+            Some(source.to_string()),
+            youtube_video_id(source),
+            None,
+        );
+    }
+    let output = std::process::Command::new("yt-dlp")
+        .args([
+            "--no-warnings",
+            "--skip-download",
+            "--print",
+            "%(webpage_url)s",
+            "--print",
+            "%(id)s",
+            "--print",
+            "%(title)s",
+            source,
+        ])
+        .output();
+    let Ok(out) = output else {
+        return (None, None, None);
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let url = lines.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let id = lines.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let title = lines.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    (url, id, title)
+}
+
 /// Pick the best "artist / uploader" string for a yt-dlp JSON line.
 /// Prefer explicit `artist`, then `channel`, then `uploader`, then `creator`
 /// — falls back to an empty string so the CLI formatter doesn't have to
@@ -1647,5 +2154,10 @@ fn run_download_job(
                 }
             }
         }
+    }
+    // Automatic recognition after a successful download. Runs on its own
+    // thread and is a no-op when no AcoustID key is configured.
+    if let Ok(song) = &result {
+        crate::metadata::maybe_recognize_async(song.id);
     }
 }

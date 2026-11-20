@@ -32,11 +32,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut SJNMusicApp) {
     // the file into its songs dir and registers it.
     ui.horizontal(|ui| {
         ui.label("Import local file:");
+        // Leave room for the two buttons to the right: `desired_width` of
+        // INFINITY would let the field eat the whole row and push them out.
+        let field_width = (ui.available_width() - 230.0).max(120.0);
         let input = ui.add(
             egui::TextEdit::singleline(&mut app.import_path)
                 .hint_text("/path/to/song.mp3 (mp3, flac, ogg, wav)")
-                .desired_width(f32::INFINITY),
+                .desired_width(field_width),
         );
+        if ui
+            .button("\u{1F4C2} Browse\u{2026}")
+            .on_hover_text("Pick the file in the system file dialog")
+            .clicked()
+        {
+            start_browse(app);
+        }
         let can_import = !app.import_path.trim().is_empty();
         let clicked = ui
             .add_enabled(can_import, egui::Button::new("\u{1F4C1} Import"))
@@ -44,6 +54,26 @@ pub fn show(ui: &mut egui::Ui, app: &mut SJNMusicApp) {
         let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if clicked || (enter && can_import) {
             start_import(app);
+        }
+    });
+
+    // Direct audio-file URL: the daemon validates the link, downloads it
+    // without yt-dlp and stores the URL as the song's permanent source.
+    ui.horizontal(|ui| {
+        ui.label("Audio URL:");
+        let field_width = (ui.available_width() - 160.0).max(120.0);
+        let input = ui.add(
+            egui::TextEdit::singleline(&mut app.direct_url)
+                .hint_text("https://server.example/songs/song.mp3")
+                .desired_width(field_width),
+        );
+        let can_download = !app.direct_url.trim().is_empty();
+        let clicked = ui
+            .add_enabled(can_download, egui::Button::new("\u{2B07} Download URL"))
+            .clicked();
+        let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if clicked || (enter && can_download) {
+            start_direct_download(app);
         }
     });
     ui.separator();
@@ -235,9 +265,69 @@ fn flag_color(f: &str) -> egui::Color32 {
     }
 }
 
+/// Open the native file dialog for the import row. `rfd`'s portal backend
+/// blocks until the user answers, so this runs on a worker thread and hands
+/// the picked path back through `app.import_pick_bus`; the field is only
+/// filled in, the user still presses Import (nothing is copied until then).
+fn start_browse(app: &mut SJNMusicApp) {
+    let pick_bus = app.import_pick_bus.clone();
+    std::thread::spawn(move || {
+        let picked = rfd::FileDialog::new()
+            .set_title("Import into the sjnmusic library")
+            .add_filter("Audio", &["mp3", "flac", "ogg", "oga", "wav"])
+            .pick_file();
+        if let Some(path) = picked {
+            if let Ok(mut slot) = pick_bus.lock() {
+                *slot = Some(path.to_string_lossy().into_owned());
+            }
+        }
+    });
+}
+
 /// Hand the typed path to the daemon's `/import`. Runs off-thread because
 /// the daemon copies the file locally, and refreshes the library cache in
 /// the same worker so the new song shows up without a manual Refresh.
+/// Derive a library name from the file component of a direct URL.
+fn direct_name_from_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let last = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("download");
+    let decoded = urlencoding::decode(last)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| last.to_string());
+    let stem = decoded
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(decoded.as_str())
+        .trim();
+    if stem.is_empty() {
+        "download".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+fn start_direct_download(app: &mut SJNMusicApp) {
+    let url = app.direct_url.trim().to_string();
+    if url.is_empty() {
+        return;
+    }
+    let name = direct_name_from_url(&url);
+    app.direct_url.clear();
+    app.search_just_downloaded = Some(format!(
+        "Queued \"{}\" from URL. Watch Downloads for live status.",
+        name
+    ));
+    let daemon = app.daemon.clone();
+    std::thread::spawn(move || match daemon.init(&name, Some(&url)) {
+        Ok(resp) => log::info!("direct URL init accepted: job {}", resp.job_id),
+        Err(e) => log::warn!("direct URL init failed: {e}"),
+    });
+}
+
 fn start_import(app: &mut SJNMusicApp) {
     let path = app.import_path.trim().to_string();
     if path.is_empty() {

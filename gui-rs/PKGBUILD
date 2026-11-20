@@ -27,6 +27,7 @@ depends=(
   wayland # winit Wayland backend
 )
 makedepends=(cargo rust)
+optdepends=('xdg-desktop-portal: native file dialog for the "Browse…" button')
 options=(!lto) # LTO is set in gui-rs/Cargo.toml's release profile
 source=("$pkgname::git+$url.git#branch=main")
 sha256sums=(SKIP)

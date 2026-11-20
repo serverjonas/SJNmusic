@@ -9,6 +9,7 @@ use crate::{
     auth,
     config::Config,
     db::open_db,
+    metadata,
     mpris,
     server::start_server,
     state::{DaemonState, RepeatMode, Song},
@@ -102,6 +103,10 @@ pub fn run(mut cfg: Config) {
 
     let auth_token = resolve_auth_token(&mut cfg);
     warn_if_publicly_exposed(&cfg.server.host, auth_token.is_some());
+
+    // Make the metadata section available to recognition/scan workers
+    // before the HTTP server can accept requests.
+    metadata::initialize(&cfg.metadata);
 
     let conn = open_db();
     let audio_handle = Arc::new(spawn_audio_thread());

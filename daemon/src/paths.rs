@@ -99,8 +99,13 @@ pub fn db_path() -> String {
     p.to_string_lossy().to_string()
 }
 
+/// Config always lives under the default base dir, independent of
+/// `library.music_dir`: `Config::load()` runs before `initialize()` can
+/// resolve a custom music dir, so using the resolved base here would make
+/// saves (auth token, metadata settings) land in a file the next start
+/// never reads.
 pub fn config_path() -> String {
-    let mut p = base_dir_inner();
+    let mut p = default_base_dir();
     p.push("config.toml");
     p.to_string_lossy().to_string()
 }

@@ -33,6 +33,213 @@ pub struct Song {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<f64>,
+
+    // Metadata (all nullable on the daemon).
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub album_artist: Option<String>,
+    #[serde(default)]
+    pub composer: Option<String>,
+    #[serde(default)]
+    pub genre: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<i64>,
+    #[serde(default)]
+    pub track_number: Option<i64>,
+    #[serde(default)]
+    pub track_total: Option<i64>,
+    #[serde(default)]
+    pub disc_number: Option<i64>,
+    #[serde(default)]
+    pub disc_total: Option<i64>,
+    #[serde(default)]
+    pub isrc: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_recording_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_release_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_release_group_id: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_artist_id: Option<String>,
+    #[serde(default)]
+    pub acoustid_id: Option<String>,
+    #[serde(default)]
+    pub acoustid_score: Option<f64>,
+    #[serde(default)]
+    pub metadata_source: Option<String>,
+    #[serde(default)]
+    pub metadata_confidence: Option<f64>,
+    #[serde(default)]
+    pub metadata_last_updated_at: Option<i64>,
+    #[serde(default)]
+    pub metadata_last_checked_at: Option<i64>,
+    #[serde(default)]
+    pub metadata_status: Option<String>,
+    #[serde(default)]
+    pub metadata_error: Option<String>,
+
+    // Original source (permanent; never changed by scans).
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub source_identifier: Option<String>,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_platform: Option<String>,
+    #[serde(default)]
+    pub source_created_at: Option<i64>,
+    #[serde(default)]
+    pub source_metadata: Option<String>,
+}
+
+/// `[metadata]` section of the daemon config. Mirrors
+/// `daemon::config::MetadataConfig`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetadataSettings {
+    pub auto_recognize: bool,
+    pub write_tags: bool,
+    pub acoustid_api_key: String,
+    pub min_confidence: f64,
+    pub multi_match_policy: String,
+    pub use_musicbrainz: bool,
+    pub user_agent: String,
+    pub musicbrainz_endpoint: String,
+    pub acoustid_endpoint: String,
+    pub cache_days: u64,
+}
+
+impl Default for MetadataSettings {
+    fn default() -> Self {
+        Self {
+            auto_recognize: true,
+            write_tags: true,
+            acoustid_api_key: String::new(),
+            min_confidence: 0.7,
+            multi_match_policy: "skip".to_string(),
+            use_musicbrainz: true,
+            user_agent: "sjnmusicd/0.1 (https://github.com/sjnmusic)".to_string(),
+            musicbrainz_endpoint: "https://musicbrainz.org/ws/2/".to_string(),
+            acoustid_endpoint: "https://api.acoustid.org/v2/lookup".to_string(),
+            cache_days: 30,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MetadataStatus {
+    #[serde(default)]
+    pub acoustid_configured: bool,
+    #[serde(default)]
+    pub musicbrainz_enabled: bool,
+    #[serde(default)]
+    pub fpcalc_available: bool,
+    #[serde(default)]
+    pub auto_recognize: bool,
+    #[serde(default)]
+    pub write_tags: bool,
+    #[serde(default)]
+    pub total_songs: i64,
+    #[serde(default)]
+    pub complete_songs: i64,
+    #[serde(default)]
+    pub missing_songs: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScanResult {
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub already_complete: i64,
+    #[serde(default)]
+    pub missing: i64,
+    #[serde(default)]
+    pub scanned: i64,
+    #[serde(default)]
+    pub recognized: i64,
+    #[serde(default)]
+    pub not_recognized: i64,
+    #[serde(default)]
+    pub skipped: i64,
+    #[serde(default)]
+    pub updated_database: i64,
+    #[serde(default)]
+    pub updated_files: i64,
+    #[serde(default)]
+    pub errors: i64,
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScanStatus {
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default)]
+    pub finished: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub already_complete: i64,
+    #[serde(default)]
+    pub missing: i64,
+    #[serde(default)]
+    pub processed: i64,
+    #[serde(default)]
+    pub recognized: i64,
+    #[serde(default)]
+    pub not_recognized: i64,
+    #[serde(default)]
+    pub skipped: i64,
+    #[serde(default)]
+    pub updated_database: i64,
+    #[serde(default)]
+    pub updated_files: i64,
+    #[serde(default)]
+    pub errors: i64,
+    #[serde(default)]
+    pub current_song: Option<String>,
+    #[serde(default)]
+    pub current_step: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+    #[serde(default)]
+    pub result: Option<ScanResult>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceTestResult {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueuedResponse {
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default)]
+    pub song_id: i64,
 }
 
 /// One yt-dlp candidate from `GET /search/yt`.
@@ -441,6 +648,68 @@ impl DaemonClient {
 
     pub fn songs(&self) -> Result<Vec<Song>, DaemonError> {
         Ok(self.get::<SongsList>("/songs")?.songs)
+    }
+
+    /// Full detail row (metadata + source) for one song.
+    pub fn song(&self, id: i64) -> Result<Song, DaemonError> {
+        self.get(&format!("/songs/{id}"))
+    }
+
+    pub fn metadata_settings(&self) -> Result<MetadataSettings, DaemonError> {
+        self.get("/metadata/settings")
+    }
+
+    pub fn save_metadata_settings(
+        &self,
+        settings: &MetadataSettings,
+    ) -> Result<MetadataSettings, DaemonError> {
+        let body = serde_json::to_value(settings)
+            .map_err(|e| DaemonError::Decode(e.to_string()))?;
+        self.post_json("/metadata/settings", &body)
+    }
+
+    pub fn metadata_status(&self) -> Result<MetadataStatus, DaemonError> {
+        self.get("/metadata/status")
+    }
+
+    pub fn test_metadata_service(
+        &self,
+        service: &str,
+    ) -> Result<ServiceTestResult, DaemonError> {
+        self.post_json(
+            "/metadata/test",
+            &serde_json::json!({ "service": service }),
+        )
+    }
+
+    pub fn start_scan(&self, force: bool) -> Result<ScanStatus, DaemonError> {
+        self.post_json("/metadata/scan", &serde_json::json!({ "force": force }))
+    }
+
+    pub fn scan_status(&self) -> Result<ScanStatus, DaemonError> {
+        self.get("/metadata/scan")
+    }
+
+    pub fn cancel_scan(&self) -> Result<serde_json::Value, DaemonError> {
+        self.post_json("/metadata/scan/cancel", &serde_json::json!({}))
+    }
+
+    pub fn recognize_song(
+        &self,
+        song_id: i64,
+        force: bool,
+    ) -> Result<QueuedResponse, DaemonError> {
+        self.post_json(
+            "/metadata/recognize",
+            &serde_json::json!({ "song_id": song_id, "force": force }),
+        )
+    }
+
+    pub fn sync_song_to_file(&self, song_id: i64) -> Result<QueuedResponse, DaemonError> {
+        self.post_json(
+            "/metadata/sync",
+            &serde_json::json!({ "song_id": song_id }),
+        )
     }
 
     pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>, DaemonError> {

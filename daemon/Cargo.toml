@@ -28,3 +28,13 @@ base64 = "0.22"
 zbus = "4"
 zbus_macros = "4"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+# HTTP client for AcoustID / MusicBrainz metadata lookup. `rustls-tls`
+# avoids a system OpenSSL dependency; blocking mode fits the daemon's
+# thread-based worker model (recognition runs on background threads, so
+# it never blocks the HTTP loop).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Audio tag read/write for all containers the library supports.
+lofty = "0.22"
+# Content hashing for re-import duplicate detection (keeps the original
+# source association when the same file is imported twice).
+sha2 = "0.10"
